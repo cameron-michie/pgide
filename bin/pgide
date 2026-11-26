@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+# pgide — a terminal Postgres workbench.
+#
+#   ┌──────────────────────────────────────────────┐
+#   │ Helix  (scratch.sql, snippets, Postgres LSP) │   one WezTerm tab
+#   ├──────────────────────────────────────────────┤   per connection
+#   │ psql   (persistent session, results in pspg) │
+#   └──────────────────────────────────────────────┘
+#
+# Sessions / connections
+#   pgide                      pick a connection (fzf) and open a workbench in this pane
+#   pgide NAME | open NAME     open a workbench for NAME in this pane
+#   pgide add NAME [--plain]   save a connection (URL goes to the macOS Keychain; --plain = config file)
+#   pgide ls | rm NAME | edit NAME | test NAME | doctor | version
+#
+# Editor-facing (bound to `space ,` keys in Helix — see config/helix/config.toml)
+#   pgide run      [--mode auto|selection|block|file|clipboard] [--file F] [--line N] [--lang L]
+#   pgide explain  [--analyze] [same options as run]
+#   pgide describe [--file F --line N --col C]      (\d+ for relations, \sf+/\df+ for functions)
+#   pgide cancel | toggle-x | focus | browse-tab | last-run
+#
+# psql-facing
+#   SELECT ... \g (format=csv) |pgide vd           open a result in VisiData (the psqlrc :vd macro)
+#
+# Debugging: PGIDE_DRYRUN=1 prints what would be sent to the psql pane instead of sending it.
+
+set -euo pipefail
+
+PGIDE_VERSION="0.1.0"
+
+# ---------------------------------------------------------------- settings
+: "${PGIDE_CONFIG:=${XDG_CONFIG_HOME:-$HOME/.config}/pgide}"
+# Optional settings file, sourced by every pgide process (including the ones WezTerm spawns,
+# which do NOT inherit your shell's environment). Put overrides of the defaults below in it.
+if [ -f "$PGIDE_CONFIG/config" ]; then . "$PGIDE_CONFIG/config"; fi
+
+: "${PGIDE_HOME:=$HOME/sql}"                                    # workspaces + _snippets
+: "${PGIDE_STATE:=${XDG_STATE_HOME:-$HOME/.local/state}/pgide}" # run history, pane ids
+: "${PGIDE_KEYCHAIN_SERVICE:=pgide}"
+: "${PGIDE_LAYOUT:=bottom}"               # bottom | right   (where the psql/results pane goes)
+: "${PGIDE_SPLIT_PERCENT:=55}"            # size of the psql/results pane
+: "${PGIDE_BROWSER:=rainfrog}"            # rainfrog | harlequin   (for `space , b`)
+: "${PGIDE_PAGER:=pspg -X -F --ignore-case --bold-labels --no-commandbar}"  # add -s N for a theme
+: "${PGIDE_ECHO:=1}"                      # echo each statement above its results
+: "${PGIDE_FOCUS_RESULTS:=0}"             # move focus to the results pane after each run
+: "${PGIDE_DRYRUN:=0}"
+
+PG_VARS="PGHOST PGHOSTADDR PGPORT PGUSER PGPASSWORD PGDATABASE PGSERVICE PGSSLMODE PGSSLROOTCERT
+PGSSLCERT PGSSLKEY PGAPPNAME PGCONNECT_TIMEOUT PGOPTIONS PGTARGETSESSIONATTRS PGCHANNELBINDING
+PGGSSENCMODE DATABASE_URL"
+
+# Panes spawned by WezTerm get the GUI's minimal PATH, so add the usual places ourselves.
+for d in "$HOME/.cargo/bin" "$HOME/.local/bin" /usr/local/bin /opt/homebrew/bin \
+         /usr/local/opt/libpq/bin /opt/homebrew/opt/libpq/bin; do
+  if [ -d "$d" ]; then
+    case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH" ;; esac
+  fi
+done
+export PATH
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------- helpers
+die()  { printf 'pgide: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'pgide: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+need() { have "$1" || die "missing '$1' — install with: ${2:-brew install $1}"; }
+
+wez() {
+  if have wezterm; then wezterm "$@"
+  elif [ -x /Applications/WezTerm.app/Contents/MacOS/wezterm ]; then
+    /Applications/WezTerm.app/Contents/MacOS/wezterm "$@"
+  else die "can't find the wezterm CLI"; fi
+}
+
+ask() {  # ask "question" default(y|n) -> 0 for yes
+  local ans hint="[y/N]"
+  if [ "$2" = y ]; then hint="[Y/n]"; fi
+  printf '%s %s ' "$1" "$hint" >&2
+  read -r ans || ans=""
+  case "${ans:-$2}" in y|Y|yes|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# sed rather than ${var//pat/rep}: bash 3.2 (macOS /bin/bash) handles backslashes in the
+# replacement differently from bash 4.3+, which silently broke %-decoding there.
+urldecode()   { printf '%b' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/%/\\x/g')"; }
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+trim_trailing() { printf '%s' "${1%"${1##*[![:space:]]}"}"; }
+
+# ---------------------------------------------------------------- connections
+conn_file()  { printf '%s/connections/%s.conf' "$PGIDE_CONFIG" "$1"; }
+valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
+
+load_flags() {  # sources the connection's (non-secret) flags
+  local f; f="$(conn_file "$1")"
+  [ -f "$f" ] || die "unknown connection '$1' (see: pgide ls)"
+  PGIDE_READONLY=0; PGIDE_DANGER=0; PGIDE_LSP_DB=0; PGIDE_URL=""
+  # shellcheck source=/dev/null
+  . "$f"
+}
+
+resolve_url() {  # prints the URL for connection $1 (call load_flags first)
+  if [ -n "${PGIDE_URL:-}" ]; then printf '%s' "$PGIDE_URL"; return; fi
+  have security || die "no URL for '$1' and no macOS Keychain — re-add it with: pgide add $1 --plain"
+  security find-generic-password -s "$PGIDE_KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null \
+    || die "no Keychain entry for '$1' (service '$PGIDE_KEYCHAIN_SERVICE') — run: pgide add $1"
+}
+
+export_pg_env() {  # postgres://user:pass@host:port/db?k=v  ->  libpq PG* variables + DATABASE_URL
+  local url="$1" rest userinfo="" query="" path="" hostport host port user pass kv k v
+  case "$url" in postgres://*|postgresql://*) ;; *) die "expected a postgres:// or postgresql:// URL" ;; esac
+  rest="${url#*://}"
+  case "$rest" in *@*) userinfo="${rest%@*}"; rest="${rest##*@}" ;; esac
+  case "$rest" in *\?*) query="${rest#*\?}"; rest="${rest%%\?*}" ;; esac
+  case "$rest" in */*) path="${rest#*/}"; hostport="${rest%%/*}" ;; *) hostport="$rest" ;; esac
+  case "$hostport" in
+    *,*) die "multi-host URLs aren't supported" ;;
+    \[*) host="${hostport%%]*}"; host="${host#\[}"; port="${hostport##*]}"; port="${port#:}" ;;
+    *:*) host="${hostport%:*}"; port="${hostport##*:}" ;;
+    *)   host="$hostport"; port="" ;;
+  esac
+  user="${userinfo%%:*}"
+  case "$userinfo" in *:*) pass="${userinfo#*:}" ;; *) pass="" ;; esac
+  [ -n "$host" ] || die "the URL has no host"
+  case "$port" in ''|*[!0-9]*) [ -z "$port" ] || die "bad port '$port'" ;; esac
+
+  for v in $PG_VARS; do unset "$v"; done
+  PGHOST="$(urldecode "$host")"; export PGHOST
+  if [ -n "$port" ]; then PGPORT="$port"; export PGPORT; fi
+  if [ -n "$user" ]; then PGUSER="$(urldecode "$user")"; export PGUSER; fi
+  if [ -n "$pass" ]; then PGPASSWORD="$(urldecode "$pass")"; export PGPASSWORD; fi
+  if [ -n "$path" ]; then PGDATABASE="$(urldecode "$path")"; export PGDATABASE; fi
+  if [ -n "$query" ]; then
+    set -f
+    local IFS='&'
+    for kv in $query; do
+      k="${kv%%=*}"; v="$(urldecode "${kv#*=}")"
+      case "$k" in
+        sslmode)              PGSSLMODE="$v";            export PGSSLMODE ;;
+        sslrootcert)          PGSSLROOTCERT="$v";        export PGSSLROOTCERT ;;
+        sslcert)              PGSSLCERT="$v";            export PGSSLCERT ;;
+        sslkey)               PGSSLKEY="$v";             export PGSSLKEY ;;
+        application_name)     PGAPPNAME="$v";            export PGAPPNAME ;;
+        connect_timeout)      PGCONNECT_TIMEOUT="$v";    export PGCONNECT_TIMEOUT ;;
+        options)              PGOPTIONS="$v";            export PGOPTIONS ;;
+        target_session_attrs) PGTARGETSESSIONATTRS="$v"; export PGTARGETSESSIONATTRS ;;
+        channel_binding)      PGCHANNELBINDING="$v";     export PGCHANNELBINDING ;;
+        gssencmode)           PGGSSENCMODE="$v";         export PGGSSENCMODE ;;
+        '') ;;
+        *) warn "ignoring URL parameter '$k'" ;;
+      esac
+    done
+    set +f
+  fi
+  PGAPPNAME="${PGAPPNAME:-pgide}"; export PGAPPNAME
+  DATABASE_URL="$url"; export DATABASE_URL
+}
+
+# ---------------------------------------------------------------- workspace
+setup_workspace() {  # prints the workspace dir for connection $1
+  local ws="$PGIDE_HOME/$1"
+  mkdir -p "$ws" "$PGIDE_HOME/_snippets" "$PGIDE_STATE/runs/$1" "$PGIDE_STATE/panes"
+  if [ ! -e "$ws/snippets" ]; then ln -s ../_snippets "$ws/snippets"; fi
+  if [ ! -f "$ws/scratch.sql" ]; then
+    cat > "$ws/scratch.sql" <<EOF
+-- $1 · scratch                         (blank lines separate runnable blocks)
+-- space , r  run selection, or the block under the cursor   space , a  run whole file
+-- space , e  EXPLAIN    space , E  EXPLAIN ANALYZE (rolled back)    space , d  describe name
+-- space , p  run clipboard   space , c  cancel   space , x  toggle \\x   space , f  focus results
+
+select current_user, current_database(), version();
+EOF
+  fi
+  printf '%s' "$ws"
+}
+
+write_lsp_config() {  # $1 = workspace, $2 = URL (empty = no DB connection for the LSP)
+  local f="$1/postgres-language-server.jsonc" db
+  if [ -n "$2" ]; then
+    db="\"connectionString\": \"$(json_escape "$2")\", \"allowStatementExecutionsAgainst\": []"
+  else
+    db='"disableConnection": true'
+  fi
+  ( umask 077
+    cat > "$f" <<EOF
+{
+  // Generated by pgide each time the workbench opens; change PGIDE_LSP_DB in the
+  // connection file instead of editing this.
+  "\$schema": "https://pg-language-server.com/latest/schema.json",
+  "db": { $db }
+}
+EOF
+  )
+  chmod 600 "$f"
+}
+
+# ---------------------------------------------------------------- open a workbench
+_CLEAN_WS=""; _CLEAN_URL=""
+_cleanup_open() { if [ -n "$_CLEAN_URL" ]; then write_lsp_config "$_CLEAN_WS" ""; _CLEAN_URL=""; fi; }
+
+cmd_open() {
+  local name="${1:-}"
+  valid_name "$name" || die "usage: pgide open NAME"
+  load_flags "$name"
+  need hx "brew install helix"; need psql "brew install libpq"; need jq
+  have pspg || warn "pspg not found — results will use the default pager (brew install pspg)"
+  [ -n "${WEZTERM_PANE:-}" ] || die "pgide open has to run inside a WezTerm pane"
+
+  local ws url="" title dir repl v
+  ws="$(setup_workspace "$name")"
+  if [ "$PGIDE_LSP_DB" = 1 ]; then url="$(resolve_url "$name")"; fi
+  write_lsp_config "$ws" "$url"
+  _CLEAN_WS="$ws"; _CLEAN_URL="$url"
+  trap _cleanup_open EXIT
+
+  title="pg:$name"
+  if [ "$PGIDE_DANGER" = 1 ]; then title="⚠ pg:$name"; fi
+  wez cli set-tab-title --pane-id "$WEZTERM_PANE" "$title" >/dev/null 2>&1 || true
+
+  case "$PGIDE_LAYOUT" in right) dir=--right ;; *) dir=--bottom ;; esac
+  repl="$(wez cli split-pane --pane-id "$WEZTERM_PANE" "$dir" --percent "$PGIDE_SPLIT_PERCENT" \
+            --cwd "$ws" -- "$SELF" repl "$name")" || die "couldn't split the pane"
+  printf '%s\n' "$repl" > "$PGIDE_STATE/panes/$name"
+  printf '%s\n' "$name" > "$PGIDE_STATE/panes/_last"
+
+  # Helix (and the shared postgres-language-server daemon it starts) must not inherit
+  # credentials: the LSP gets its DB settings from the per-workspace config file only.
+  local scrub=()
+  for v in $PG_VARS; do scrub+=(-u "$v"); done
+  ( cd "$ws" && env "${scrub[@]}" PGIDE_CONN="$name" PGIDE_REPL_PANE="$repl" hx scratch.sql ) || true
+
+  _cleanup_open
+  if ask "Close the psql pane for $name too?" y; then
+    wez cli kill-pane --pane-id "$repl" >/dev/null 2>&1 || true
+    rm -f "$PGIDE_STATE/panes/$name"
+  fi
+}
+
+cmd_pick() {
+  need fzf
+  local names name
+  names="$(ls "$PGIDE_CONFIG/connections" 2>/dev/null | sed -n 's/\.conf$//p')"
+  [ -n "$names" ] || die "no connections yet — add one with: pgide add NAME"
+  name="$(printf '%s\n' "$names" | fzf --prompt='postgres › ' --height=40% --reverse \
+           --preview "cat \"$PGIDE_CONFIG/connections/\"{}.conf")" || exit 0
+  cmd_open "$name"
+}
+
+# ---------------------------------------------------------------- the psql pane
+psqlrc_wrapper() {  # user's ~/.psqlrc + pgide's psqlrc, without double-loading
+  local w="$PGIDE_STATE/psqlrc" user_rc="${HOME}/.psqlrc" pg_rc="$PGIDE_CONFIG/psqlrc"
+  : > "$w"
+  if [ -f "$user_rc" ]; then printf "\\\\i '%s'\n" "$user_rc" >> "$w"; fi
+  if [ -f "$pg_rc" ] && ! grep -q 'pgide/psqlrc' "$user_rc" 2>/dev/null; then
+    printf "\\\\i '%s'\n" "$pg_rc" >> "$w"
+  fi
+  [ -f "$pg_rc" ] || warn "$pg_rc not found — run install.sh (no read-only guard, prompt or macros)"
+  printf '%s' "$w"
+}
+
+cmd_repl() {
+  local name="${1:-}" ans
+  valid_name "$name" || die "usage: pgide repl NAME"
+  load_flags "$name"
+  mkdir -p "$PGIDE_STATE"
+  local url; url="$(resolve_url "$name")"
+  export_pg_env "$url"
+  PSQLRC="$(psqlrc_wrapper)"; export PSQLRC
+  if have pspg; then
+    PSQL_PAGER="$PGIDE_PAGER"; PSQL_WATCH_PAGER="pspg --stream"; export PSQL_PAGER PSQL_WATCH_PAGER
+  fi
+  PGIDE_CONN="$name"; export PGIDE_CONN
+
+  local args=(-v "pgide_name=$name")
+  if [ "$PGIDE_READONLY" = 1 ]; then args+=(-v pgide_readonly=1); fi
+  if [ "$PGIDE_DANGER" = 1 ]; then args+=(-v pgide_danger=1); fi
+
+  while :; do
+    if [ "$PGIDE_DANGER" = 1 ]; then
+      printf '\033[1;97;41m ⚠  %s — production / customer data \033[0m\n' "$name"
+    fi
+    psql "${args[@]}" || true
+    printf '\npsql exited — [enter] reconnect · [q] close this pane: '
+    ans=""; read -r ans || exit 0
+    case "$ans" in q|Q) exit 0 ;; esac
+  done
+}
+
+# ---------------------------------------------------------------- talking to the psql pane
+SESSION_CONN=""; SESSION_PANE=""; PANE_TTY=""
+
+resolve_session() {
+  SESSION_CONN="${PGIDE_CONN:-}"; SESSION_PANE="${PGIDE_REPL_PANE:-}"
+  if [ -z "$SESSION_CONN" ]; then SESSION_CONN="$(cat "$PGIDE_STATE/panes/_last" 2>/dev/null || true)"; fi
+  [ -n "$SESSION_CONN" ] || die "no pgide session — start one with: pgide"
+  if [ -z "$SESSION_PANE" ]; then SESSION_PANE="$(cat "$PGIDE_STATE/panes/$SESSION_CONN" 2>/dev/null || true)"; fi
+  [ -n "$SESSION_PANE" ] || die "no psql pane for '$SESSION_CONN' — reopen with: pgide open $SESSION_CONN"
+  if [ "$PGIDE_DRYRUN" = 1 ]; then return; fi
+  local info
+  info="$(wez cli list --format json | jq -r --argjson p "$SESSION_PANE" \
+            '.[] | select(.pane_id == $p) | "ok " + (.tty_name // "")')"
+  case "$info" in ok*) PANE_TTY="${info#ok }" ;; *) die "the psql pane is gone — reopen with: pgide open $SESSION_CONN" ;; esac
+}
+
+send_raw() {
+  if [ "$PGIDE_DRYRUN" = 1 ]; then printf '[pane %s] %q\n' "$SESSION_PANE" "$1"; return; fi
+  printf '%s' "$1" | wez cli send-text --pane-id "$SESSION_PANE" --no-paste
+}
+send_line() { send_raw "$1"$'\r'; }
+
+pager_busy() {  # is pspg/less in the foreground of the psql pane?
+  [ -n "$PANE_TTY" ] || return 1
+  ps -o stat=,comm= -t "$PANE_TTY" 2>/dev/null | awk '
+    $1 ~ /\+/ { n = split($2, p, "/"); if (p[n] ~ /^(pspg|less|more)$/) hit = 1 }
+    END { exit hit ? 0 : 1 }'
+}
+
+close_pager() {
+  pager_busy || return 0
+  send_raw q
+  local i=0
+  while pager_busy; do
+    i=$((i + 1))
+    [ "$i" -lt 30 ] || die "the results pager is busy — press q in the results pane"
+    sleep 0.05
+  done
+}
+
+focus_results() {
+  if [ "$PGIDE_DRYRUN" = 1 ]; then return; fi
+  wez cli activate-pane --pane-id "$SESSION_PANE" >/dev/null 2>&1 || true
+}
+
+psql_command() {  # run one psql line in the pane (closing the pager and clearing the input line first)
+  close_pager
+  send_raw $'\025'          # Ctrl-U: drop anything half-typed at the prompt
+  send_line "$1"
+}
+
+write_run() {  # $1 = SQL, $2 = label; prints the path of the run file
+  local dir="$PGIDE_STATE/runs/$SESSION_CONN" f body label last
+  mkdir -p "$dir"
+  f="$dir/$(date +%Y%m%d-%H%M%S)-$$.sql"
+  body="$(trim_trailing "$1")"
+  label="$(printf '%s' "$2" | tr -d "'\\\\")"
+  last="${body##*$'\n'}"; last="${last#"${last%%[![:space:]]*}"}"
+  {
+    printf '%s\n' '\set ON_ERROR_STOP on'
+    if [ "$PGIDE_ECHO" = 1 ]; then printf '%s\n' '\set ECHO queries'; else printf '%s\n' '\set ECHO none'; fi
+    printf '%s\n' "\\echo '── $(date +%H:%M:%S) · $label ──'"
+    printf '%s\n' "$body"
+    # terminate a trailing statement (on its own line, so a trailing -- comment can't eat it)
+    case "$last" in *\;|\\*) ;; *) printf ';\n' ;; esac
+    printf '%s\n' '\set ECHO none'
+  } > "$f"
+  ln -sfn "$f" "$PGIDE_STATE/runs/last.sql"
+  printf '%s' "$f"
+}
+
+submit() {  # $1 = SQL, $2 = label
+  local f; f="$(write_run "$1" "$2")"
+  psql_command "\\i '$f'"
+  if [ "$PGIDE_FOCUS_RESULTS" = 1 ]; then focus_results; fi
+}
+
+# ---------------------------------------------------------------- getting SQL out of the editor
+OPT_MODE=auto; OPT_FILE=""; OPT_LINE=""; OPT_COL=""; OPT_LANG=""; OPT_ANALYZE=0; SEL=""; SQL=""; LABEL=""
+
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode)    OPT_MODE="${2:-}"; shift 2 ;;
+      --file)    OPT_FILE="${2:-}"; shift 2 ;;
+      --line)    OPT_LINE="${2:-}"; shift 2 ;;
+      --col)     OPT_COL="${2:-}";  shift 2 ;;
+      --lang)    OPT_LANG="${2:-}"; shift 2 ;;
+      --analyze) OPT_ANALYZE=1;     shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  if [ -n "$OPT_LANG" ] && [ "$OPT_LANG" != sql ]; then die "not a SQL buffer ($OPT_LANG)"; fi
+  # :pipe-to hands us the selection on stdin; :sh gives us nothing.
+  if [ ! -t 0 ]; then SEL="$(cat)"; fi
+}
+
+extract_block() {  # $1 = file, $2 = line → the run of non-blank lines around that line
+  awk -v n="$2" '
+    { line[NR] = $0 }
+    END {
+      if (n < 1 || n > NR || line[n] ~ /^[[:space:]]*$/) exit 2
+      s = n; while (s > 1  && line[s - 1] !~ /^[[:space:]]*$/) s--
+      e = n; while (e < NR && line[e + 1] !~ /^[[:space:]]*$/) e++
+      for (i = s; i <= e; i++) print line[i]
+    }' "$1"
+}
+
+ident_at() {  # $1 = file, $2 = line, $3 = column → identifier (schema.name, "Quoted") at that spot
+  awk -v n="$2" -v c="$3" 'NR == n {
+      s = c; while (s > 1 && substr($0, s - 1, 1) ~ /[A-Za-z0-9_."$]/) s--
+      e = c; while (e <= length($0) && substr($0, e, 1) ~ /[A-Za-z0-9_."$]/) e++
+      print substr($0, s, e - s); exit }' "$1"
+}
+
+get_sql() {
+  case "$OPT_MODE" in
+    auto)
+      if [ "${#SEL}" -gt 1 ]; then OPT_MODE=selection; else OPT_MODE=block; fi
+      get_sql; return ;;
+    selection)
+      SQL="$SEL"; LABEL="selection${OPT_FILE:+ · $OPT_FILE}" ;;
+    block)
+      [ -n "$OPT_FILE" ] && [ -n "$OPT_LINE" ] || die "block mode needs --file and --line"
+      [ -f "$OPT_FILE" ] || die "can't read '$OPT_FILE' — save the buffer to a file first"
+      SQL="$(extract_block "$OPT_FILE" "$OPT_LINE")" || die "the cursor is on a blank line — nothing to run"
+      LABEL="$OPT_FILE:$OPT_LINE" ;;
+    file)
+      [ -f "$OPT_FILE" ] || die "can't read '$OPT_FILE'"
+      SQL="$(cat "$OPT_FILE")"; LABEL="$OPT_FILE" ;;
+    clipboard)
+      need pbpaste "macOS only"
+      SQL="$(pbpaste)"; LABEL="clipboard" ;;
+    *) die "unknown mode '$OPT_MODE'" ;;
+  esac
+  [ -n "$(printf '%s' "$SQL" | tr -d '[:space:]')" ] || die "nothing to run"
+}
+
+# ---------------------------------------------------------------- editor-facing commands
+cmd_run() { parse_opts "$@"; resolve_session; get_sql; submit "$SQL" "$LABEL"; }
+
+cmd_explain() {
+  parse_opts "$@"; resolve_session; get_sql
+  local body="$SQL"
+  while :; do
+    case "$body" in *\;|*[[:space:]]) body="${body%?}" ;; *) break ;; esac
+  done
+  if [ "$OPT_ANALYZE" = 1 ]; then
+    # EXPLAIN ANALYZE really executes the statement, so always throw the effects away:
+    # inside an open transaction use a savepoint, otherwise wrap it in BEGIN … ROLLBACK.
+    SQL="$(cat <<EOF
+\set ON_ERROR_STOP off
+SELECT (now() <> statement_timestamp()) AS pgide_in_txn \gset
+\if :pgide_in_txn
+SAVEPOINT pgide_explain;
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, WAL)
+$body
+;
+ROLLBACK TO SAVEPOINT pgide_explain;
+RELEASE SAVEPOINT pgide_explain;
+\else
+BEGIN;
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, WAL)
+$body
+;
+ROLLBACK;
+\endif
+\set ON_ERROR_STOP on
+EOF
+)"
+    LABEL="EXPLAIN ANALYZE, rolled back · $LABEL"
+  else
+    SQL="EXPLAIN (VERBOSE, SETTINGS)
+$body
+;"
+    LABEL="EXPLAIN · $LABEL"
+  fi
+  submit "$SQL" "$LABEL"
+}
+
+norm_part() {  # Postgres identifier folding: "Quoted" keeps case, bare names fold to lower
+  local v
+  case "$1" in \"*\") v="${1#\"}"; printf '%s' "${v%\"}" ;; *) printf '%s' "$1" | tr '[:upper:]' '[:lower:]' ;; esac
+}
+
+cmd_describe() {
+  parse_opts "$@"; resolve_session
+  local ident schema="" fn
+  if [ "${#SEL}" -gt 1 ]; then ident="$SEL"
+  else
+    [ -f "$OPT_FILE" ] && [ -n "$OPT_LINE" ] && [ -n "$OPT_COL" ] || die "put the cursor on a name (or select it)"
+    ident="$(ident_at "$OPT_FILE" "$OPT_LINE" "$OPT_COL")"
+  fi
+  ident="$(printf '%s' "$ident" | tr -d '[:space:]')"; ident="${ident%.}"; ident="${ident%%(*}"
+  case "$ident" in ''|*[!A-Za-z0-9_.\"\$]*) die "not a table, view or function name: '$ident'" ;; esac
+  fn="$ident"
+  case "$ident" in *.*) schema="$(norm_part "${ident%%.*}")"; fn="${ident#*.}" ;; esac
+  fn="$(norm_part "$fn")"
+  submit "$(cat <<EOF
+\set ECHO none
+\set pgide_ident '$ident'
+\set pgide_fn '$fn'
+\set pgide_schema '$schema'
+SELECT to_regclass(:'pgide_ident') IS NOT NULL AS pgide_is_rel,
+       count(p.oid) = 1 AS pgide_fn_one,
+       count(p.oid) > 1 AS pgide_fn_many
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE p.proname = :'pgide_fn' AND (:'pgide_schema' = '' OR n.nspname = :'pgide_schema') \gset
+\if :pgide_is_rel
+\d+ $ident
+\elif :pgide_fn_one
+\sf+ $ident
+\elif :pgide_fn_many
+\df+ $ident
+\else
+\echo 'pgide: no relation or function called $ident'
+\endif
+EOF
+)" "describe $ident"
+}
+
+cmd_cancel()   { resolve_session; send_raw $'\003'; }
+cmd_toggle_x() { resolve_session; psql_command '\x'; }
+cmd_focus()    { resolve_session; focus_results; }
+cmd_last_run() {
+  local l="$PGIDE_STATE/runs/last.sql"
+  [ -e "$l" ] || die "nothing has been run yet"
+  readlink "$l" 2>/dev/null || printf '%s\n' "$l"
+}
+
+# ---------------------------------------------------------------- browser + VisiData
+cmd_browse() {
+  local name="${1:-}"
+  valid_name "$name" || die "usage: pgide browse NAME"
+  load_flags "$name"
+  local url; url="$(resolve_url "$name")"
+  export_pg_env "$url"
+  case "$PGIDE_BROWSER" in
+    rainfrog)  need rainfrog; exec rainfrog ;;   # picks up DATABASE_URL
+    harlequin) need harlequin "uv tool install 'harlequin[postgres]'"
+               if [ "$PGIDE_READONLY" = 1 ]; then exec harlequin -a postgres --read-only; fi
+               exec harlequin -a postgres ;;      # picks up the PG* variables
+    *) die "unknown PGIDE_BROWSER '$PGIDE_BROWSER' (rainfrog | harlequin)" ;;
+  esac
+}
+
+cmd_browse_tab() {
+  resolve_session
+  local p
+  p="$(wez cli spawn --cwd "$PGIDE_HOME/$SESSION_CONN" -- "$SELF" browse "$SESSION_CONN")"
+  wez cli set-tab-title --pane-id "$p" "pg:$SESSION_CONN · browse" >/dev/null 2>&1 || true
+}
+
+cmd_vd() {  # stdin = CSV (from psql: \g (format=csv) |pgide vd)
+  need vd "brew install visidata"
+  local dir="$PGIDE_STATE/results" f
+  mkdir -p "$dir"; f="$dir/$(date +%Y%m%d-%H%M%S)-$$.csv"
+  cat > "$f"
+  [ -s "$f" ] || die "no rows to show"
+  wez cli split-pane --pane-id "${WEZTERM_PANE:?not inside WezTerm}" --right --percent 60 \
+      -- "$SELF" _vd "$f" >/dev/null
+}
+
+# ---------------------------------------------------------------- connection management
+cmd_add() {
+  local name="${1:-}" plain=0 url danger readonly lsp urlline=""
+  valid_name "$name" || die "usage: pgide add NAME [--plain]   (NAME: letters, digits, . _ -)"
+  if [ "${2:-}" = --plain ]; then plain=1; fi
+  mkdir -p "$PGIDE_CONFIG/connections"
+  printf 'Connection URL for %s (postgres://… — input hidden): ' "$name" >&2
+  read -rs url; printf '\n' >&2
+  ( export_pg_env "$url" ) || die "couldn't parse that URL"
+
+  if ask "Production / customer data? (red tab + banner)" n; then danger=1; else danger=0; fi
+  if ask "Start psql sessions read-only (default_transaction_read_only = on)?" \
+         "$([ "$danger" = 1 ] && echo y || echo n)"; then readonly=1; else readonly=0; fi
+  if ask "Let the Postgres LSP connect for schema-aware completion? (URL sits in a 0600 file while open)" n
+  then lsp=1; else lsp=0; fi
+
+  if [ "$plain" = 0 ] && have security; then
+    security add-generic-password -U -s "$PGIDE_KEYCHAIN_SERVICE" -a "$name" -l "pgide: $name" -w "$url" \
+      || die "couldn't write to the Keychain"
+  else
+    if [ "$plain" = 0 ]; then warn "no macOS Keychain here — storing the URL in the connection file"; fi
+    urlline="PGIDE_URL=$(shell_quote "$url")"
+  fi
+  ( umask 077
+    cat > "$(conn_file "$name")" <<EOF
+# pgide connection '$name' — edit with: pgide edit $name
+PGIDE_DANGER=$danger     # 1 = red tab, banner and prompt
+PGIDE_READONLY=$readonly   # 1 = psql starts with default_transaction_read_only = on
+PGIDE_LSP_DB=$lsp     # 1 = postgres-language-server connects for completion / type checks
+$urlline
+EOF
+  )
+  printf 'saved. check it with: pgide test %s    open it with: pgide %s\n' "$name" "$name"
+}
+
+cmd_test() {
+  local name="${1:-}"
+  valid_name "$name" || die "usage: pgide test NAME"
+  load_flags "$name"; need psql "brew install libpq"
+  local url; url="$(resolve_url "$name")"
+  export_pg_env "$url"
+  psql -X -At -c "select current_user || ' @ ' || current_database() || '  ·  ' || version()"
+}
+
+cmd_ls() {
+  local f n flags
+  for f in "$PGIDE_CONFIG"/connections/*.conf; do
+    if [ ! -e "$f" ]; then echo "no connections yet — pgide add NAME"; return; fi
+    n="$(basename "$f" .conf)"
+    flags="$( PGIDE_DANGER=0 PGIDE_READONLY=0 PGIDE_LSP_DB=0 PGIDE_URL=""; . "$f"
+              [ "$PGIDE_DANGER" = 1 ] && printf '⚠ prod  '
+              [ "$PGIDE_READONLY" = 1 ] && printf 'read-only  '
+              [ "$PGIDE_LSP_DB" = 1 ] && printf 'lsp-db  '
+              [ -n "$PGIDE_URL" ] && printf 'plain-url'
+              true )"
+    printf '%-28s %s\n' "$n" "$flags"
+  done
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  valid_name "$name" || die "usage: pgide rm NAME"
+  rm -f "$(conn_file "$name")"
+  if have security; then security delete-generic-password -s "$PGIDE_KEYCHAIN_SERVICE" -a "$name" >/dev/null 2>&1 || true; fi
+  echo "removed $name (workspace $PGIDE_HOME/$name left in place)"
+}
+
+cmd_edit() {
+  local name="${1:-}"
+  valid_name "$name" || die "usage: pgide edit NAME"
+  [ -f "$(conn_file "$name")" ] || die "unknown connection '$name'"
+  "${EDITOR:-hx}" "$(conn_file "$name")"
+}
+
+cmd_doctor() {
+  local t v d
+  printf 'required\n'
+  for t in hx psql pspg jq fzf; do
+    if have "$t"; then v="$("$t" --version 2>/dev/null | head -n1)"; printf '  ✓ %-26s %s\n' "$t" "$v"
+    else printf '  ✗ %s\n' "$t"; fi
+  done
+  if v="$(wez --version 2>/dev/null)"; then printf '  ✓ %-26s %s\n' wezterm "$v"; else printf '  ✗ wezterm\n'; fi
+  printf 'optional\n'
+  for t in postgres-language-server rainfrog harlequin vd; do
+    if have "$t"; then v="$("$t" --version 2>/dev/null | head -n1)"; printf '  ✓ %-26s %s\n' "$t" "$v"
+    else printf '  · %s (not installed)\n' "$t"; fi
+  done
+  if have postgres-language-server; then  # catches builds whose parser bindings are broken
+    d="$(mktemp -d)"; printf 'create table t (id int);\n' > "$d/t.sql"
+    if (cd "$d" && postgres-language-server check t.sql >/dev/null 2>&1); then
+      printf '  ✓ %-26s %s\n' "language server parser" "ok ($(command -v postgres-language-server))"
+    else
+      printf '  ✗ %-26s %s\n' "language server parser" "broken: $(command -v postgres-language-server) — see README › Troubleshooting"
+    fi
+    rm -rf "$d"
+  fi
+  printf 'config\n  %s\n  %s\n' "$PGIDE_CONFIG/psqlrc $([ -f "$PGIDE_CONFIG/psqlrc" ] && echo ✓ || echo '✗ missing')" \
+         "workspaces in $PGIDE_HOME"
+}
+
+usage() { sed -n '2,/^set -euo/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------- dispatch
+main() {
+  local cmd="${1:-}"
+  if [ $# -gt 0 ]; then shift; fi
+  case "$cmd" in
+    '')            cmd_pick ;;
+    open)          cmd_open "$@" ;;
+    add)           cmd_add "$@" ;;
+    ls|list)       cmd_ls ;;
+    rm|remove)     cmd_rm "$@" ;;
+    edit)          cmd_edit "$@" ;;
+    test)          cmd_test "$@" ;;
+    doctor)        cmd_doctor ;;
+    repl)          cmd_repl "$@" ;;
+    run)           cmd_run "$@" ;;
+    explain)       cmd_explain "$@" ;;
+    describe)      cmd_describe "$@" ;;
+    cancel)        cmd_cancel ;;
+    toggle-x)      cmd_toggle_x ;;
+    focus)         cmd_focus ;;
+    last-run)      cmd_last_run ;;
+    browse)        cmd_browse "$@" ;;
+    browse-tab)    cmd_browse_tab ;;
+    vd)            cmd_vd ;;
+    _vd)           exec vd "$1" ;;
+    -h|--help|help) usage ;;
+    -V|--version|version) printf 'pgide %s\n' "$PGIDE_VERSION" ;;
+    *)
+      if valid_name "$cmd" && [ -f "$(conn_file "$cmd")" ]; then cmd_open "$cmd"
+      else die "unknown command or connection: $cmd (try: pgide help)"; fi ;;
+  esac
+}
+
+# Run unless sourced (the tests source this file to exercise individual functions).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

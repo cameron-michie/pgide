@@ -1,0 +1,35 @@
+# ── pgide: Postgres workbench keys ────────────────────────────────────────────
+# Append to ~/.config/helix/config.toml. Needs Helix 25.07+ (command-line expansions).
+# Everything lives under `space ,` so nothing built in is shadowed. The keys are safe in
+# non-SQL buffers: pgide refuses to run anything whose language isn't sql.
+#
+# "Block" = the run of non-blank lines around the cursor, so keep a unit of work
+# (e.g. begin … rollback) together with no blank lines inside it.
+
+[keys.normal.space.","]
+# Helix can't label custom keys, and shows every multi-step binding as "[Multiple commands]".
+# This entry puts a legend in the popup itself (pressing ? also echoes it to the status line).
+"?" = ':echo r run · a file · p clipboard · e explain · E analyze · d describe · x expanded · c cancel · f focus · b browse · l last-run'
+# run: the selection if you've made one, otherwise the block under the cursor
+r = [":update", ':pipe-to pgide run --file "%{buffer_name}" --line %{cursor_line} --lang %{language}']
+# run the whole file
+a = [":update", ':sh pgide run --mode file --file "%{buffer_name}" --lang %{language}']
+# run whatever is on the clipboard (pasted scripts, without touching the buffer)
+p = ":sh pgide run --mode clipboard"
+# EXPLAIN / EXPLAIN (ANALYZE, BUFFERS, …) — analyze runs inside a transaction that is rolled back
+e = [":update", ':pipe-to pgide explain --file "%{buffer_name}" --line %{cursor_line} --lang %{language}']
+E = [":update", ':pipe-to pgide explain --analyze --file "%{buffer_name}" --line %{cursor_line} --lang %{language}']
+# describe the table / view / function under the cursor (\d+, \sf+ or \df+)
+d = [":update", ':pipe-to pgide describe --file "%{buffer_name}" --line %{cursor_line} --col %{cursor_column}']
+# psql pane helpers
+x = ":sh pgide toggle-x"     # toggle expanded output (\x)
+c = ":sh pgide cancel"       # cancel the running query (Ctrl-C in the psql pane)
+f = ":sh pgide focus"        # jump to the results pane (WezTerm pane focus)
+b = ":sh pgide browse-tab"   # open rainfrog/harlequin on the same connection in a new tab
+l = ":open %sh{pgide last-run}"   # open the exact SQL file of the last run
+
+[keys.select.space.","]
+r = ':pipe-to pgide run --mode selection --lang %{language}'
+e = ':pipe-to pgide explain --mode selection --lang %{language}'
+E = ':pipe-to pgide explain --analyze --mode selection --lang %{language}'
+d = ':pipe-to pgide describe'

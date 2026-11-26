@@ -1,0 +1,19 @@
+# ── pgide: Postgres language server for .sql ──────────────────────────────────
+# Append to ~/.config/helix/languages.toml   (brew install postgres-language-server)
+#
+# The server reads postgres-language-server.jsonc from the workspace root. pgide writes
+# one per connection into ~/sql/<name>/ each time it opens a workbench, so completions
+# and type checks always point at the database that tab is talking to (or at nothing,
+# for connections where PGIDE_LSP_DB=0).
+
+[language-server.postgres-language-server]
+command = "postgres-language-server"
+args = ["lsp-proxy"]
+
+[[language]]
+name = "sql"
+language-servers = ["postgres-language-server"]
+roots = ["postgres-language-server.jsonc"]
+# Never reformat on save: you'll be pasting customer scripts you want to keep verbatim.
+# Format on demand with `:format` when you want it.
+auto-format = false

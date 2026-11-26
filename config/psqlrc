@@ -1,0 +1,75 @@
+-- pgide psqlrc  ·  installed to ~/.config/pgide/psqlrc
+--
+-- pgide's psql pane loads your ~/.psqlrc and then this file. To get the same
+-- defaults and macros in plain `psql` too, add this line to ~/.psqlrc:
+--     \i ~/.config/pgide/psqlrc
+-- The pgide-only parts below are guarded with \if :{?pgide_name}.
+
+\set QUIET 1
+
+-- ── display ────────────────────────────────────────────────────────────────
+\pset null '∅'
+\pset linestyle unicode
+\pset border 2
+\timing on
+
+-- ── editing, history, errors ───────────────────────────────────────────────
+\set COMP_KEYWORD_CASE preserve-lower
+\set HISTCONTROL ignoredups
+\set HISTSIZE 50000
+\set ON_ERROR_ROLLBACK interactive
+\set SHOW_CONTEXT errors
+
+-- ── prompt: who / which db / transaction state (* open, ! failed) ──────────
+\set PROMPT2 '%R%x%# '
+\if :{?pgide_name}
+  \set HISTFILE ~/.psql_history-:pgide_name
+  -- Every result goes to pspg; with -F it exits straight away when the result fits on screen.
+  \pset pager always
+  \if :{?pgide_danger}
+    \set PROMPT1 '%[%033[1;97;41m%] ⚠ %:pgide_name: %[%033[0m%] %n/%/%R%x%# '
+  \else
+    \set PROMPT1 '%[%033[1;35m%]%:pgide_name:%[%033[0m%] %n/%/%R%x%# '
+  \endif
+  \if :{?pgide_readonly}
+    SET default_transaction_read_only = on;
+    \echo '🔒 read-only guard is on (a guard rail, not a permission). To write: SET default_transaction_read_only = off;'
+  \endif
+\else
+  \set PROMPT1 '%[%033[1;36m%]%n@%M%[%033[0m%]/%/%R%x%# '
+\endif
+
+-- ── macros: type the name on its own line, e.g.  :activity ───────────────
+-- Sessions and locks
+\set activity 'SELECT pid, usename, application_name AS app, client_addr, state, wait_event_type || '':'' || wait_event AS waiting_on, now() - xact_start AS xact_age, now() - query_start AS query_age, left(regexp_replace(query, ''\\s+'', '' '', ''g''), 140) AS query FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND state IS DISTINCT FROM ''idle'' ORDER BY query_start NULLS LAST;'
+\set blocking 'SELECT blocked.pid AS blocked_pid, blocked.usename AS blocked_user, now() - blocked.query_start AS blocked_for, blocking.pid AS blocking_pid, blocking.usename AS blocking_user, blocking.state AS blocking_state, left(regexp_replace(blocked.query, ''\\s+'', '' '', ''g''), 80) AS blocked_query, left(regexp_replace(blocking.query, ''\\s+'', '' '', ''g''), 80) AS blocking_query FROM pg_stat_activity blocked CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) JOIN pg_stat_activity blocking ON blocking.pid = b.pid ORDER BY blocked_for DESC;'
+\set conns 'SELECT usename, application_name AS app, state, count(*) AS n, current_setting(''max_connections'') AS max_conns FROM pg_stat_activity GROUP BY 1, 2, 3 ORDER BY n DESC;'
+
+-- Storage and maintenance
+\set sizes 'SELECT n.nspname AS schema, c.relname AS name, CASE c.relkind WHEN ''r'' THEN ''table'' WHEN ''p'' THEN ''partitioned'' WHEN ''m'' THEN ''matview'' END AS kind, c.reltuples::bigint AS est_rows, pg_size_pretty(pg_total_relation_size(c.oid)) AS total, pg_size_pretty(pg_relation_size(c.oid)) AS heap, pg_size_pretty(pg_indexes_size(c.oid)) AS indexes FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN (''r'', ''p'', ''m'') AND n.nspname NOT IN (''pg_catalog'', ''information_schema'') AND n.nspname !~ ''^pg_toast'' ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 50;'
+\set vacuum 'SELECT schemaname AS schema, relname AS table, n_live_tup, n_dead_tup, round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct, last_autovacuum, last_vacuum, last_autoanalyze, last_analyze FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 30;'
+\set cache_hit 'SELECT ''tables'' AS kind, round(100.0 * sum(heap_blks_hit) / nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS hit_pct FROM pg_statio_user_tables UNION ALL SELECT ''indexes'', round(100.0 * sum(idx_blks_hit) / nullif(sum(idx_blks_hit) + sum(idx_blks_read), 0), 2) FROM pg_statio_user_indexes;'
+\set unused_indexes 'SELECT s.schemaname AS schema, s.relname AS table, s.indexrelname AS index, pg_size_pretty(pg_relation_size(s.indexrelid)) AS size, s.idx_scan FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid = s.indexrelid WHERE s.idx_scan = 0 AND NOT i.indisunique AND NOT i.indisprimary ORDER BY pg_relation_size(s.indexrelid) DESC;'
+
+-- Query performance (needs pg_stat_statements; on Supabase it lives in the extensions schema)
+\set slow 'SELECT round(total_exec_time::numeric, 1) AS total_ms, calls, round(mean_exec_time::numeric, 2) AS mean_ms, round((100 * total_exec_time / nullif(sum(total_exec_time) OVER (), 0))::numeric, 1) AS pct, rows, left(regexp_replace(query, ''\\s+'', '' '', ''g''), 160) AS query FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 25;'
+
+-- Security: RLS coverage, policies, SECURITY DEFINER functions (anon/auth columns are NULL off-Supabase)
+\set rls 'SELECT n.nspname AS schema, c.relname AS table, c.relrowsecurity AS rls_enabled, c.relforcerowsecurity AS rls_forced, count(p.polname) AS policies FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_policy p ON p.polrelid = c.oid WHERE c.relkind IN (''r'', ''p'') AND n.nspname NOT IN (''pg_catalog'', ''information_schema'') AND n.nspname !~ ''^pg_'' GROUP BY 1, 2, 3, 4 ORDER BY rls_enabled, schema, "table";'
+\set policies 'SELECT schemaname AS schema, tablename AS table, policyname AS policy, permissive, roles, cmd, qual AS using_expr, with_check FROM pg_policies ORDER BY 1, 2, 3;'
+\set definers 'SELECT n.nspname AS schema, p.proname AS function, pg_get_function_identity_arguments(p.oid) AS args, pg_get_userbyid(p.proowner) AS owner, p.proconfig AS config, has_function_privilege(anon.oid, p.oid, ''EXECUTE'') AS anon_exec, has_function_privilege(authd.oid, p.oid, ''EXECUTE'') AS auth_exec FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace LEFT JOIN pg_roles anon ON anon.rolname = ''anon'' LEFT JOIN pg_roles authd ON authd.rolname = ''authenticated'' WHERE p.prosecdef AND n.nspname NOT IN (''pg_catalog'', ''information_schema'') ORDER BY 1, 2;'
+
+-- Server
+\set settings 'SELECT name, setting, unit, source FROM pg_settings WHERE source NOT IN (''default'', ''override'') ORDER BY name;'
+\set uptime 'SELECT now() - pg_postmaster_start_time() AS uptime, version();'
+
+-- Result sinks: end a query with one of these instead of ;
+\set csv '\\g (format=csv) |pbcopy'
+\set vd '\\g (format=csv) |pgide vd'
+
+\if :{?pgide_name}
+  \echo 'macros  :activity :blocking :conns :sizes :vacuum :cache_hit :unused_indexes :slow :rls :policies :definers :settings :uptime'
+  \echo 'sinks   end a query with :csv (copy as CSV) or :vd (open in VisiData) instead of ;'
+\endif
+
+\unset QUIET
