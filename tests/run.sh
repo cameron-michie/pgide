@@ -134,11 +134,40 @@ has "LSP config with DB"          "$(cat "$ws/postgres-language-server.jsonc")" 
 eq  "LSP config is private"       "$(ls -l "$ws/postgres-language-server.jsonc" | cut -c1-10)" "-rw-------"
 ( . "$PGIDE"; write_lsp_config "$ws" "" )
 has "LSP config without DB"       "$(cat "$ws/postgres-language-server.jsonc")" '"disableConnection": true'
+has "ls shows the URL"            "$(pg ls)" "$url"
 pg rm acme >/dev/null
 has "rm removes the connection"   "$(pg ls)" "no connections yet"
 has "version" "$(pg --version)" "pgide "
 out="$(pg nope 2>&1)"
 has "unknown command message" "$out" "unknown command or connection"
+
+# ------------------------------------------------------------------ ephemeral sessions, Helix config
+echo "Ephemeral sessions and Helix config"
+eq "name from a Supabase pooler URL" \
+   "$( ( . "$PGIDE"; ephemeral_name 'postgresql://postgres.abcdefgh:pw@aws-0-eu-west-2.pooler.supabase.com:5432/postgres' ) )" \
+   "abcdefgh-postgres"
+eq "name from a plain host" "$( ( . "$PGIDE"; ephemeral_name 'postgres://u@localhost:54322/app' ) )" "localhost-app"
+mkdir -p "$PGIDE_STATE/ephemeral"; printf 'PGIDE_URL=x\n' > "$PGIDE_STATE/ephemeral/eph.conf"
+eq "ephemeral file is found by conn_file" "$( ( . "$PGIDE"; conn_file eph ) )" "$PGIDE_STATE/ephemeral/eph.conf"
+eq "saved connections still resolve"      "$( ( . "$PGIDE"; conn_file saved ) )" "$PGIDE_CONFIG/connections/saved.conf"
+out="$(pg connect not-a-url --name x 2>&1)"
+has "connect rejects a non-URL" "$out" "expected a postgres://"
+eq "…and leaves nothing behind" "$(ls "$PGIDE_STATE/ephemeral" | grep -c '^x.conf$')" "0"
+mkdir -p "$PGIDE_CONFIG/helix" "$tmp/hx"
+cp "$here/../config/helix/"*.toml "$PGIDE_CONFIG/helix/"
+printf 'theme = "mine"\n' > "$tmp/hx/config.toml"
+ws="$tmp/ws"; mkdir -p "$ws"
+gen="$( ( export HELIX_CONFIG_DIR="$tmp/hx"; . "$PGIDE"; write_helix_config "$ws" ) )"
+has "generated config keeps the user's settings" "$(cat "$gen")" 'theme = "mine"'
+has "…and adds the pgide keys"                   "$(cat "$gen")" '[keys.normal.space.","]'
+cp "$here/../config/helix/config.toml" "$tmp/hx/legacy.toml"
+{ printf 'theme = "mine"\n\n[keys.normal]\nC-g = "x"\n\n'; cat "$here/../config/helix/config.toml"; } > "$tmp/hx/config.toml"
+gen="$( ( export HELIX_CONFIG_DIR="$tmp/hx"; . "$PGIDE"; write_helix_config "$ws" ) )"
+eq  "legacy hand-appended block isn't duplicated" "$(grep -c '^\[keys.normal.space' "$gen")" "1"
+has "…and the user's other keys survive"         "$(cat "$gen")" 'C-g = "x"'
+printf 'theme = "mine"\n' > "$tmp/hx/config.toml"
+eq  "user's own config is untouched"             "$(cat "$tmp/hx/config.toml")" 'theme = "mine"'
+has "workspace gets the language server entry"   "$(cat "$ws/.helix/languages.toml")" 'postgres-language-server'
 
 echo
 echo "$pass passed, $fail failed"

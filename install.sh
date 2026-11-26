@@ -6,25 +6,33 @@
 #   ./install.sh --no-brew     skip the Homebrew step
 #   ./install.sh --no-lsp      skip the Postgres language server
 #   ./install.sh --update-lsp  re-download the latest language server release
+#   ./install.sh --no-wezterm  don't touch wezterm.lua
+#   ./install.sh --uninstall   remove the wezterm.lua block and pgide's files (keeps ~/sql and connections)
 #
-# It never edits your Helix or WezTerm config; it prints what to add instead.
+# WezTerm: appends one marked block to wezterm.lua (a .bak is kept; re-runs update it in place).
+# Helix: your config is never edited. pgide merges its keys into a generated config that only
+# pgide-launched Helix instances use (hx -c), and puts the language server settings in each
+# workspace's .helix/languages.toml.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
-link=0; brew=1; lsp=1; update_lsp=0
+link=0; brew=1; lsp=1; update_lsp=0; wez=1; uninstall=0
 for arg in "$@"; do
   case "$arg" in
     --link)       link=1 ;;
     --no-brew)    brew=0 ;;
     --no-lsp)     lsp=0 ;;
     --update-lsp) update_lsp=1 ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-wezterm) wez=0 ;;
+    --uninstall)  uninstall=1 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $arg (try --help)" >&2; exit 1 ;;
   esac
 done
 
 place() {  # place SRC DEST MODE — copy, or symlink with --link
+  if [ "$1" -ef "$2" ]; then return 0; fi   # already the same file (re-running over a --link install)
   if [ "$link" = 1 ]; then ln -sfn "$1" "$2"; else install -m "$3" "$1" "$2"; fi
 }
 
@@ -58,6 +66,54 @@ install_lsp() {
   else echo "  ⚠ installed, but its parser self-check failed"; fi
 }
 
+BEGIN_MARK="-- >>> pgide >>> (managed by pgide's install.sh; remove with ./install.sh --uninstall)"
+END_MARK="-- <<< pgide <<<"
+
+wezterm_config() {  # the wezterm.lua that WezTerm will actually load
+  if [ -n "${WEZTERM_CONFIG_FILE:-}" ]; then printf '%s' "$WEZTERM_CONFIG_FILE"
+  elif [ -f "$HOME/.wezterm.lua" ]; then printf '%s' "$HOME/.wezterm.lua"
+  else printf '%s' "$cfg/wezterm/wezterm.lua"; fi
+}
+
+strip_block() {  # strip_block FILE — print FILE without the pgide block
+  awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0 == b { skip = 1 } !skip && !(drop && $0 == "") { print } { drop = 0 } $0 == e { skip = 0; drop = 1 }' "$1"
+}
+
+patch_wezterm() {
+  local f tmp; f="$(wezterm_config)"
+  if [ ! -f "$f" ]; then
+    mkdir -p "$(dirname "$f")"
+    printf "local wezterm = require 'wezterm'\nlocal config = wezterm.config_builder()\n\nreturn config\n" > "$f"
+    echo "  created $f"
+  fi
+  if ! grep -q '^return config' "$f"; then
+    echo "  ⚠ no 'return config' line in $f; add this yourself:  require('pgide').apply(config)"; return 0
+  fi
+  cp "$f" "$f.pgide.bak"
+  tmp="$(mktemp)"
+  strip_block "$f" > "$tmp"
+  # insert the block before the last 'return config'
+  awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+    { line[NR] = $0 } /^return config/ { last = NR }
+    END { for (i = 1; i <= NR; i++) {
+            if (i == last) { print b; print "require('"'"'pgide'"'"').apply(config)"; print e; print "" }
+            print line[i] } }' "$tmp" > "$f"
+  rm -f "$tmp"
+  echo "  $f: pgide block added (backup: $f.pgide.bak)"
+}
+
+if [ "$uninstall" = 1 ]; then
+  f="$(wezterm_config)"
+  if [ -f "$f" ] && grep -qF -- "$BEGIN_MARK" "$f"; then
+    tmp="$(mktemp)"; strip_block "$f" > "$tmp"; cat "$tmp" > "$f"; rm -f "$tmp"
+    echo "removed the pgide block from $f"
+  fi
+  rm -f "$HOME/.local/bin/pgide" "$cfg/wezterm/pgide.lua" "$cfg/pgide/psqlrc"
+  rm -rf "$cfg/pgide/helix"
+  echo "removed pgide's files. Left in place: $cfg/pgide/connections, ~/sql, ~/.local/state/pgide"
+  exit 0
+fi
+
 if [ "$brew" = 1 ]; then
   command -v brew >/dev/null || { echo "Homebrew is required (or use --no-brew): https://brew.sh" >&2; exit 1; }
   echo "→ Homebrew packages"
@@ -81,7 +137,7 @@ if [ "$lsp" = 1 ]; then
 fi
 
 echo "→ pgide"
-mkdir -p "$HOME/.local/bin" "$cfg/pgide/connections" "$HOME/sql/_snippets"
+mkdir -p "$HOME/.local/bin" "$cfg/pgide/connections" "$cfg/pgide/helix" "$HOME/sql/_snippets"
 chmod 700 "$cfg/pgide" "$cfg/pgide/connections"
 chmod +x "$here/bin/pgide"
 place "$here/bin/pgide"    "$HOME/.local/bin/pgide" 0755
@@ -89,10 +145,11 @@ place "$here/config/psqlrc" "$cfg/pgide/psqlrc"      0644
 for f in "$here"/snippets/*.sql; do
   [ -e "$HOME/sql/_snippets/$(basename "$f")" ] || cp "$f" "$HOME/sql/_snippets/"
 done
-if [ ! -e "$cfg/wezterm/pgide.lua" ]; then
-  mkdir -p "$cfg/wezterm"
-  place "$here/config/wezterm/pgide.lua" "$cfg/wezterm/pgide.lua" 0644
-fi
+place "$here/config/helix/config.toml"    "$cfg/pgide/helix/config.toml"    0644
+place "$here/config/helix/languages.toml" "$cfg/pgide/helix/languages.toml" 0644
+mkdir -p "$cfg/wezterm"
+place "$here/config/wezterm/pgide.lua" "$cfg/wezterm/pgide.lua" 0644
+if [ "$wez" = 1 ]; then patch_wezterm; fi
 
 libpq_bin="/opt/homebrew/opt/libpq/bin"
 if command -v brew >/dev/null; then libpq_bin="$(brew --prefix libpq)/bin"; fi
@@ -103,23 +160,18 @@ Installed $("$HOME/.local/bin/pgide" --version)$([ "$link" = 1 ] && echo " (syml
 
 Remaining steps:
 
-  1. Helix — add the keys and the language server (only adds keys under 'space ,'):
-       cat "$here/config/helix/config.toml"    >> ~/.config/helix/config.toml
-       cat "$here/config/helix/languages.toml" >> ~/.config/helix/languages.toml
-     If languages.toml already has a [[language]] entry named "sql", merge by hand instead.
-     Check with:  hx --health sql
+  1. WezTerm — reload its config (CMD+SHIFT+R) to pick up the pgide key.$([ "$wez" = 0 ] && printf "\n     Add to wezterm.lua before 'return config':  require('pgide').apply(config)")
+     Helix needs no setup: pgide starts it with its own merged config.
 
-  2. WezTerm — in wezterm.lua, before 'return config':
-       require('pgide').apply(config)       -- LEADER + d opens the picker in a new tab
-
-  3. Shell — make sure these are on PATH:
+  2. Shell — make sure these are on PATH:
        export PATH="\$HOME/.local/bin:$libpq_bin:\$PATH"
      Optional, for plain psql outside pgide:
        export PSQL_PAGER='pspg -X -F --ignore-case --bold-labels --no-commandbar'
        echo '\\i ~/.config/pgide/psqlrc' >> ~/.psqlrc
 
-  4. Add a connection and open it:
-       pgide add mydb && pgide test mydb && pgide mydb
+  3. Connect (from a WezTerm pane). Nothing is saved:
+       pgide postgres://user:pass@host:5432/db
+     Or save one for next time:  pgide add mydb
 
   'pgide doctor' checks the toolchain at any time.
 EOF

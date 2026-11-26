@@ -1,14 +1,14 @@
--- pgide.lua — WezTerm glue for pgide.  Copy to ~/.config/wezterm/pgide.lua, then in your
--- wezterm.lua, before `return config`:
+-- pgide.lua — WezTerm glue for pgide. install.sh copies this to ~/.config/wezterm/pgide.lua
+-- and adds a marked block to your wezterm.lua (before `return config`):
 --
---     require('pgide').apply(config)                                  -- LEADER + d
+--     require('pgide').apply(config)                                  -- LEADER + d, else CMD|SHIFT + p
 --     require('pgide').apply(config, { key = 'd', mods = 'CMD|SHIFT' })  -- or pick a key
 --
 -- What it adds:
 --   • a key that opens a new tab running the pgide connection picker
 --   • red tabs for connections flagged as production (pgide sets the title to "⚠ pg:<name>"),
---     tinted tabs for other pgide sessions
---   • left Option behaves as Alt, so rainfrog's Alt+1…5 focus keys work
+--     tinted tabs for other pgide sessions; every other tab is left alone
+--   • with { option_as_alt = true }: left Option behaves as Alt, so rainfrog's Alt+1…5 work
 --
 -- If you already have a 'format-tab-title' handler, merge the colouring below into it
 -- rather than registering a second one.
@@ -25,12 +25,16 @@ end
 function M.apply(config, opts)
   opts = opts or {}
   config.keys = config.keys or {}
+  local key, mods = opts.key, opts.mods
+  if not key then
+    if config.leader then key, mods = 'd', 'LEADER' else key, mods = 'p', 'CMD|SHIFT' end
+  end
   table.insert(config.keys, {
-    key = opts.key or 'd',
-    mods = opts.mods or 'LEADER',
+    key = key,
+    mods = mods,
     action = act.SpawnCommandInNewTab { args = { pgide_bin() } },
   })
-  if opts.option_as_alt ~= false then
+  if opts.option_as_alt then
     config.send_composed_key_when_left_alt_is_pressed = false
   end
 end

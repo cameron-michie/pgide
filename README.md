@@ -31,13 +31,13 @@ tools you already use and joins them up:
   variables. That makes things like RLS impersonation testing straightforward.
 - **A pager built for tables.** pspg gives you sorting, frozen columns, search and copying
   to the clipboard.
-- **Guard rails for production.** Credentials live in the macOS Keychain, there's an
-  optional read-only session guard, `EXPLAIN ANALYZE` is always rolled back, and
+- **Guard rails for production.** Connections are ephemeral by default (nothing is saved),
+  there's an optional read-only session guard, `EXPLAIN ANALYZE` is always rolled back, and
   production tabs are coloured red.
 
 ## Requirements
 
-- macOS (Linux mostly works: use `pgide add --plain`, and the clipboard features need `pbcopy`)
+- macOS (Linux mostly works; the clipboard features need `pbcopy`)
 - [WezTerm](https://wezterm.org)
 - [Helix](https://helix-editor.com) 25.07 or newer (for command-line expansions)
 - `psql` (from `libpq`), `pspg`, `jq`, `fzf`
@@ -52,18 +52,40 @@ git clone https://github.com/<you>/pgide.git && cd pgide
 ./install.sh --link      # symlinks, so `git pull` updates you; plain ./install.sh copies
 ```
 
-The installer Homebrew-installs the tools (`--no-brew` to skip), downloads the Postgres
+The installer Homebrew-installs the tools (`--no-brew` to skip) and downloads the Postgres
 language server's release binary into `~/.local/bin` (`--no-lsp` to skip, `--update-lsp`
-to refresh), and prints the remaining steps: append `config/helix/*.toml` to your Helix config, add
-`require('pgide').apply(config)` to `wezterm.lua`, and check your PATH. Run
-`pgide doctor` to check everything is in place.
+to refresh). It also:
+
+- **WezTerm:** appends one marked block (`require('pgide').apply(config)`) to your
+  `wezterm.lua` before `return config`, keeping a `.pgide.bak`. Re-running updates it in
+  place; `--no-wezterm` skips it. The key is `LEADER + d` if you have a leader, otherwise
+  `CMD+SHIFT+p`. Tab colouring only affects tabs titled `pg:…`.
+- **Helix:** doesn't edit your config. pgide starts Helix with `hx -c` on a generated file
+  (your `config.toml` plus the pgide keys) and writes the language server settings into each
+  workspace's `.helix/languages.toml`. So the `space ,` keys exist only in pgide sessions.
+
+`./install.sh --uninstall` removes the block and pgide's files (connections and `~/sql`
+stay). Run `pgide doctor` to check everything is in place.
 
 ## Quick start
 
 ```sh
-pgide add acme-prod     # paste the URL (hidden input) → macOS Keychain
+pgide postgres://user:pass@host:5432/db    # opens a workbench; nothing is saved
+pgide                                      # no saved connections: asks for a URL
+```
+
+A URL session is ephemeral: the URL lives in a 0600 file under `~/.local/state/pgide/ephemeral/`
+only while the editor is open, then it is deleted. The session is named from the URL (for a
+Supabase pooler, the project ref) and gets a workspace in `~/sql/<name>/`. Options:
+`--name N`, `--prod` (red tab, read-only), `--readonly`, `--lsp` (schema-aware completion).
+
+To keep a connection:
+
+```sh
+pgide add acme-prod     # paste the URL → ~/.config/pgide/connections/acme-prod.conf (0600)
+pgide add acme-prod --keychain   # or store the URL in the macOS Keychain instead
 pgide test acme-prod    # one-shot connectivity check
-pgide                   # pick a connection; or LEADER + d in WezTerm
+pgide acme-prod         # or `pgide` and pick it; `pgide ls` lists them with their URLs
 ```
 
 `pgide add` asks three questions, each stored as a flag you can change later with
@@ -74,9 +96,6 @@ pgide                   # pick a connection; or LEADER + d in WezTerm
 | `PGIDE_DANGER=1` | Red tab, banner and prompt. |
 | `PGIDE_READONLY=1` | psql starts with `default_transaction_read_only = on`. This is a guard rail, not a permission: `SET default_transaction_read_only = off` to write. |
 | `PGIDE_LSP_DB=1` | The language server connects to this database for schema-aware completion. The URL is written to a 0600 file in the workspace while the tab is open, then removed. |
-
-Use `pgide add NAME --plain` for local databases, where storing the URL in the connection
-file is fine.
 
 ## Keys
 
@@ -116,8 +135,9 @@ columns or a block and copy them, `F9` for the menu, and `q` to go back to psql.
 that fit on screen print inline without opening the pager. `\watch 2` in the psql pane
 streams into pspg.
 
-pspg's default theme is blue. On a light terminal, try `-s 0` (black & white), `20`
-(Tao Light), `21` (FlatWhite) or `23` (Paper Color). Test one live in the psql pane with
+pgide runs pspg with `-s 0`, which uses your terminal's own background and colours (pspg's
+own default is a solid blue). For another theme try `20` (Tao Light), `21` (FlatWhite) or `23`
+(Paper Color). Test one live in the psql pane with
 `\setenv PSQL_PAGER 'pspg -X -F --ignore-case --bold-labels --no-commandbar -s 20'`, then
 set `PGIDE_PAGER` in `~/.config/pgide/config` to keep it.
 
@@ -148,15 +168,15 @@ PGIDE_SPLIT_PERCENT=50       # size of the psql pane (default 55)
 PGIDE_BROWSER=harlequin      # default: rainfrog
 PGIDE_FOCUS_RESULTS=1        # jump to the results after every run
 PGIDE_ECHO=0                 # don't echo statements above their results
-PGIDE_PAGER='pspg -X -F --ignore-case --bold-labels --no-commandbar -s 20'
+PGIDE_PAGER='pspg -X -F --ignore-case --bold-labels --no-commandbar -s 20'  # default is -s 0
 PGIDE_HOME=~/work/sql        # per-connection workspaces (default ~/sql)
 ```
 
 ## How it works
 
 1. `pgide open NAME` splits the current WezTerm pane. It starts `pgide repl NAME` in the
-   new pane, which reads the URL from the Keychain itself and runs psql in a reconnect
-   loop. Then it launches Helix with the psql pane's id in the environment.
+   new pane, which reads the URL from the connection file (or Keychain) itself and runs
+   psql in a reconnect loop. Then it launches Helix with the psql pane's id in the environment.
 2. The Helix keys call `pgide` through `:pipe-to` and `:sh`, using expansions such as
    `%{buffer_name}` and `%{cursor_line}`.
 3. `pgide run` writes the SQL to a run file and checks the pane's TTY: if pspg is open, it
@@ -176,8 +196,8 @@ PGIDE_HOME=~/work/sql        # per-connection workspaces (default ~/sql)
   libpg_query 18.1.0), not your SQL. `pgide doctor` flags it. Fix:
   `brew uninstall postgres-language-server && ./install.sh --no-brew --update-lsp`, then
   `:lsp-restart` in Helix.
-- **`space ,` isn't in the Space popup:** the Helix snippet isn't in your config, or the
-  config failed to parse. Run `:config-reload` and read the status line.
+- **`space ,` isn't in the Space popup:** you opened Helix outside pgide (the keys are only
+  in pgide's generated config), or your own `config.toml` fails to parse.
 - **"the psql pane is gone":** reopen with `pgide NAME`.
 - **"results pager is busy":** pspg is in a prompt or menu. Press `q` there.
 - **Supabase transaction pooler (port 6543):** session state doesn't persist between runs.

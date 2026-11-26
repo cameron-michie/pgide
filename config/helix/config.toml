@@ -1,5 +1,7 @@
 # ── pgide: Postgres workbench keys ────────────────────────────────────────────
-# Append to ~/.config/helix/config.toml. Needs Helix 25.07+ (command-line expansions).
+# Installed to ~/.config/pgide/helix/. pgide merges this with your own config.toml into a
+# generated file and starts Helix with `hx -c`, so these keys exist only in pgide sessions.
+# Needs Helix 25.07+ (command-line expansions).
 # Everything lives under `space ,` so nothing built in is shadowed. The keys are safe in
 # non-SQL buffers: pgide refuses to run anything whose language isn't sql.
 #

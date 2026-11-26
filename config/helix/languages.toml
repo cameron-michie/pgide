@@ -1,5 +1,6 @@
 # ── pgide: Postgres language server for .sql ──────────────────────────────────
-# Append to ~/.config/helix/languages.toml   (brew install postgres-language-server)
+# Installed to ~/.config/pgide/helix/. pgide copies it to <workspace>/.helix/languages.toml,
+# which Helix layers over your own languages.toml for that workspace only.
 #
 # The server reads postgres-language-server.jsonc from the workspace root. pgide writes
 # one per connection into ~/sql/<name>/ each time it opens a workbench, so completions

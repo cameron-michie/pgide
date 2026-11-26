@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Ephemeral connections by default:** `pgide postgres://…` (or `pgide connect`, or `pgide`
+  with no saved connections) opens a workbench without saving the URL; the temporary
+  session file is deleted when the editor closes.
+- `pgide add` now stores the URL in the 0600 connection file; `--keychain` opts in to the
+  Keychain. URL input is no longer hidden, and `pgide ls` and the psql pane show the URL.
+- The installer appends a marked, idempotent block to `wezterm.lua` (`--no-wezterm`,
+  `--uninstall`). Helix is no longer edited: pgide starts it with a generated merged config
+  (`hx -c`) and a per-workspace `.helix/languages.toml`, so the keys only exist in pgide
+  sessions.
+- pspg now runs with `-s 0` (terminal background, no blue).
+- WezTerm key defaults to `CMD+SHIFT+p` when no leader is set; `option_as_alt` is now opt-in.
 - The installer downloads postgres-language-server's official release binary instead of
   using Homebrew. Homebrew's build (0.28.2 with libpg_query 18.1.0) reports a "failed to
   decode Protobuf message" syntax error on every statement. The installer warns if the

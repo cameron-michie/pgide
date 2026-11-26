@@ -8,9 +8,12 @@
 #   └──────────────────────────────────────────────┘
 #
 # Sessions / connections
-#   pgide                      pick a connection (fzf) and open a workbench in this pane
-#   pgide NAME | open NAME     open a workbench for NAME in this pane
-#   pgide add NAME [--plain]   save a connection (URL goes to the macOS Keychain; --plain = config file)
+#   pgide                      pick a saved connection, or paste a URL (fzf)
+#   pgide URL | connect [URL]  open a workbench for a URL. Ephemeral: nothing is saved, and the
+#                              URL is dropped from disk when the editor closes
+#                              [--name N] [--prod] [--readonly] [--lsp]
+#   pgide NAME | open NAME     open a workbench for a saved connection
+#   pgide add NAME [--keychain]  save a connection (URL goes in a 0600 file; --keychain = macOS Keychain)
 #   pgide ls | rm NAME | edit NAME | test NAME | doctor | version
 #
 # Editor-facing (bound to `space ,` keys in Helix — see config/helix/config.toml)
@@ -40,7 +43,7 @@ if [ -f "$PGIDE_CONFIG/config" ]; then . "$PGIDE_CONFIG/config"; fi
 : "${PGIDE_LAYOUT:=bottom}"               # bottom | right   (where the psql/results pane goes)
 : "${PGIDE_SPLIT_PERCENT:=55}"            # size of the psql/results pane
 : "${PGIDE_BROWSER:=rainfrog}"            # rainfrog | harlequin   (for `space , b`)
-: "${PGIDE_PAGER:=pspg -X -F --ignore-case --bold-labels --no-commandbar}"  # add -s N for a theme
+: "${PGIDE_PAGER:=pspg -X -F --ignore-case --bold-labels --no-commandbar -s 0}"  # -s 0 = terminal colours, see-through; try -s N for other themes
 : "${PGIDE_ECHO:=1}"                      # echo each statement above its results
 : "${PGIDE_FOCUS_RESULTS:=0}"             # move focus to the results pane after each run
 : "${PGIDE_DRYRUN:=0}"
@@ -89,7 +92,10 @@ shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 trim_trailing() { printf '%s' "${1%"${1##*[![:space:]]}"}"; }
 
 # ---------------------------------------------------------------- connections
-conn_file()  { printf '%s/connections/%s.conf' "$PGIDE_CONFIG" "$1"; }
+conn_file() {  # an ephemeral session (pgide connect) shadows a saved connection of the same name
+  if [ -f "$PGIDE_STATE/ephemeral/$1.conf" ]; then printf '%s/ephemeral/%s.conf' "$PGIDE_STATE" "$1"
+  else printf '%s/connections/%s.conf' "$PGIDE_CONFIG" "$1"; fi
+}
 valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
 
 load_flags() {  # sources the connection's (non-secret) flags
@@ -195,6 +201,27 @@ EOF
   chmod 600 "$f"
 }
 
+write_helix_config() {  # $1 = workspace. Prints the config file for `hx -c`.
+  # Helix has no include mechanism, so pgide's keys are merged with yours into a generated
+  # file that only pgide-launched Helix instances use. Your own config is never touched.
+  local out="$PGIDE_STATE/helix/config.toml" mine="$PGIDE_CONFIG/helix/config.toml"
+  local user="${HELIX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/helix}/config.toml"
+  local lang="$PGIDE_CONFIG/helix/languages.toml"
+  [ -f "$mine" ] && [ -f "$lang" ] || die "missing $PGIDE_CONFIG/helix/*.toml — run install.sh"
+  mkdir -p "$PGIDE_STATE/helix" "$1/.helix"
+  # An earlier install had you append pgide's keys to your own config.toml by hand; drop that
+  # block from the generated copy (from its header up to the next unrelated table) so the
+  # tables aren't defined twice.
+  { [ -f "$user" ] && awk '
+      /^# ── pgide: Postgres workbench keys/ { skip = 1; next }
+      skip && /^\[/ && $0 !~ /^\[keys\.(normal|select)\.space\.","\]/ { skip = 0 }
+      !skip { print }' "$user"
+    printf '\n'; cat "$mine"; } > "$out"
+  # the workspace-local languages.toml is layered over yours by Helix itself
+  cat "$lang" > "$1/.helix/languages.toml"
+  printf '%s' "$out"
+}
+
 # ---------------------------------------------------------------- open a workbench
 _CLEAN_WS=""; _CLEAN_URL=""
 _cleanup_open() { if [ -n "$_CLEAN_URL" ]; then write_lsp_config "$_CLEAN_WS" ""; _CLEAN_URL=""; fi; }
@@ -228,7 +255,8 @@ cmd_open() {
   # credentials: the LSP gets its DB settings from the per-workspace config file only.
   local scrub=()
   for v in $PG_VARS; do scrub+=(-u "$v"); done
-  ( cd "$ws" && env "${scrub[@]}" PGIDE_CONN="$name" PGIDE_REPL_PANE="$repl" hx scratch.sql ) || true
+  local hxcfg; hxcfg="$(write_helix_config "$ws")"
+  ( cd "$ws" && env "${scrub[@]}" PGIDE_CONN="$name" PGIDE_REPL_PANE="$repl" hx -c "$hxcfg" scratch.sql ) || true
 
   _cleanup_open
   if ask "Close the psql pane for $name too?" y; then
@@ -237,14 +265,63 @@ cmd_open() {
   fi
 }
 
+_ephemeral_name() {  # call inside $( ): : export_pg_env sets PG* variables
+  local h
+  export_pg_env "$1" >/dev/null 2>&1 || return 1
+  h="$PGHOST"
+  case "${PGUSER:-}" in *.*) h="${PGUSER#*.}" ;; esac
+  printf '%s-%s' "$h" "${PGDATABASE:-postgres}"
+}
+
+ephemeral_name() {  # a short session name from a URL: <supabase ref | host>-<db>
+  local n
+  n="$(_ephemeral_name "$1")" || return 1
+  printf '%s' "$n" | sed 's/[^A-Za-z0-9._-]/-/g'
+}
+
+cmd_connect() {  # open a workbench for a URL without saving it anywhere
+  local url="" name="" danger=0 readonly=0 lsp=0 f
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)     name="${2:-}"; shift 2 ;;
+      --prod)     danger=1; readonly=1; shift ;;
+      --readonly) readonly=1; shift ;;
+      --lsp)      lsp=1; shift ;;
+      -*)         die "unknown option: $1" ;;
+      *)          url="$1"; shift ;;
+    esac
+  done
+  if [ -z "$url" ]; then
+    printf 'Connection URL (postgres://…): ' >&2
+    read -r url || exit 0
+    [ -n "$url" ] || exit 0
+  fi
+  ( export_pg_env "$url" ) || die "couldn't parse that URL"
+  [ -n "$name" ] || name="$(ephemeral_name "$url")"
+  valid_name "$name" || die "bad session name '$name' (use --name)"
+  mkdir -p "$PGIDE_STATE/ephemeral"; chmod 700 "$PGIDE_STATE/ephemeral"
+  f="$PGIDE_STATE/ephemeral/$name.conf"
+  trap "rm -f $(shell_quote "$f")" EXIT
+  ( umask 077
+    cat > "$f" <<EOF
+# ephemeral pgide session '$name'. Removed when the workbench closes.
+PGIDE_DANGER=$danger
+PGIDE_READONLY=$readonly
+PGIDE_LSP_DB=$lsp
+PGIDE_URL=$(shell_quote "$url")
+EOF
+  )
+  ( cmd_open "$name" )
+}
+
 cmd_pick() {
   need fzf
-  local names name
+  local names choice new="＋ connect to a URL (not saved)"
   names="$(ls "$PGIDE_CONFIG/connections" 2>/dev/null | sed -n 's/\.conf$//p')"
-  [ -n "$names" ] || die "no connections yet — add one with: pgide add NAME"
-  name="$(printf '%s\n' "$names" | fzf --prompt='postgres › ' --height=40% --reverse \
-           --preview "cat \"$PGIDE_CONFIG/connections/\"{}.conf")" || exit 0
-  cmd_open "$name"
+  if [ -z "$names" ]; then cmd_connect; return; fi
+  choice="$(printf '%s\n%s\n' "$new" "$names" | fzf --prompt='postgres › ' --height=40% --reverse \
+           --preview "cat \"$PGIDE_CONFIG/connections/\"{}.conf 2>/dev/null")" || exit 0
+  if [ "$choice" = "$new" ]; then cmd_connect; else cmd_open "$choice"; fi
 }
 
 # ---------------------------------------------------------------- the psql pane
@@ -266,6 +343,7 @@ cmd_repl() {
   mkdir -p "$PGIDE_STATE"
   local url; url="$(resolve_url "$name")"
   export_pg_env "$url"
+  printf 'pgide: %s → %s\n' "$name" "$url"
   PSQLRC="$(psqlrc_wrapper)"; export PSQLRC
   if have pspg; then
     PSQL_PAGER="$PGIDE_PAGER"; PSQL_WATCH_PAGER="pspg --stream"; export PSQL_PAGER PSQL_WATCH_PAGER
@@ -552,12 +630,12 @@ cmd_vd() {  # stdin = CSV (from psql: \g (format=csv) |pgide vd)
 
 # ---------------------------------------------------------------- connection management
 cmd_add() {
-  local name="${1:-}" plain=0 url danger readonly lsp urlline=""
-  valid_name "$name" || die "usage: pgide add NAME [--plain]   (NAME: letters, digits, . _ -)"
-  if [ "${2:-}" = --plain ]; then plain=1; fi
+  local name="${1:-}" keychain=0 url danger readonly lsp urlline=""
+  valid_name "$name" || die "usage: pgide add NAME [--keychain]   (NAME: letters, digits, . _ -)"
+  case "${2:-}" in --keychain) keychain=1 ;; ''|--plain) ;; *) die "unknown option: $2" ;; esac
   mkdir -p "$PGIDE_CONFIG/connections"
-  printf 'Connection URL for %s (postgres://… — input hidden): ' "$name" >&2
-  read -rs url; printf '\n' >&2
+  printf 'Connection URL for %s (postgres://…): ' "$name" >&2
+  read -r url
   ( export_pg_env "$url" ) || die "couldn't parse that URL"
 
   if ask "Production / customer data? (red tab + banner)" n; then danger=1; else danger=0; fi
@@ -566,11 +644,11 @@ cmd_add() {
   if ask "Let the Postgres LSP connect for schema-aware completion? (URL sits in a 0600 file while open)" n
   then lsp=1; else lsp=0; fi
 
-  if [ "$plain" = 0 ] && have security; then
+  if [ "$keychain" = 1 ] && have security; then
     security add-generic-password -U -s "$PGIDE_KEYCHAIN_SERVICE" -a "$name" -l "pgide: $name" -w "$url" \
       || die "couldn't write to the Keychain"
   else
-    if [ "$plain" = 0 ]; then warn "no macOS Keychain here — storing the URL in the connection file"; fi
+    if [ "$keychain" = 1 ]; then warn "no macOS Keychain here — storing the URL in the connection file"; fi
     urlline="PGIDE_URL=$(shell_quote "$url")"
   fi
   ( umask 077
@@ -603,7 +681,7 @@ cmd_ls() {
               [ "$PGIDE_DANGER" = 1 ] && printf '⚠ prod  '
               [ "$PGIDE_READONLY" = 1 ] && printf 'read-only  '
               [ "$PGIDE_LSP_DB" = 1 ] && printf 'lsp-db  '
-              [ -n "$PGIDE_URL" ] && printf 'plain-url'
+              [ -n "$PGIDE_URL" ] && printf '%s' "$PGIDE_URL"
               true )"
     printf '%-28s %s\n' "$n" "$flags"
   done
@@ -646,7 +724,8 @@ cmd_doctor() {
     fi
     rm -rf "$d"
   fi
-  printf 'config\n  %s\n  %s\n' "$PGIDE_CONFIG/psqlrc $([ -f "$PGIDE_CONFIG/psqlrc" ] && echo ✓ || echo '✗ missing')" \
+  printf 'config\n  %s\n  %s\n  %s\n' "$PGIDE_CONFIG/psqlrc $([ -f "$PGIDE_CONFIG/psqlrc" ] && echo ✓ || echo '✗ missing')" \
+         "$PGIDE_CONFIG/helix $([ -f "$PGIDE_CONFIG/helix/config.toml" ] && [ -f "$PGIDE_CONFIG/helix/languages.toml" ] && echo ✓ || echo '✗ missing — run install.sh')" \
          "workspaces in $PGIDE_HOME"
 }
 
@@ -659,6 +738,8 @@ main() {
   case "$cmd" in
     '')            cmd_pick ;;
     open)          cmd_open "$@" ;;
+    connect)       cmd_connect "$@" ;;
+    postgres://*|postgresql://*) cmd_connect "$cmd" "$@" ;;
     add)           cmd_add "$@" ;;
     ls|list)       cmd_ls ;;
     rm|remove)     cmd_rm "$@" ;;
