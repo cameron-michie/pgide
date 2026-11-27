@@ -147,7 +147,14 @@ eq  "URL with a quote round-trips"   "$( ( . "$conf"; printf '%s' "$PGIDE_URL" )
 eq  "connection file is private"     "$(ls -l "$conf" | cut -c1-10)" "-rw-------"
 has "ls shows flags" "$(pg ls)" "⚠ prod"
 ws="$( ( . "$PGIDE"; setup_workspace acme ) )"
-eq  "workspace has scratch + snippets" "$(ls "$ws" | tr '\n' ' ')" "scratch.sql snippets "
+eq  "workspace has just the scratch file" "$(ls "$ws" | tr '\n' ' ')" "scratch.sql "
+ln -s ../_snippets "$ws/snippets"
+( . "$PGIDE"; setup_workspace acme >/dev/null )
+eq  "old per-workspace snippets symlink is removed" "$(ls "$ws" | tr '\n' ' ')" "scratch.sql "
+ln -s "$tmp" "$PGIDE_HOME/snippets" 2>/dev/null; rm -f "$PGIDE_HOME/snippets"
+( export PGIDE_SNIPPETS="$tmp/elsewhere"; . "$PGIDE"; setup_workspace acme >/dev/null )
+eq  "a custom bank is linked at the root" "$(readlink "$PGIDE_HOME/snippets")" "$tmp/elsewhere"
+rm -f "$PGIDE_HOME/snippets"
 ( . "$PGIDE"; write_lsp_config "$ws" "postgres://u:p@h/d" )
 has "LSP config with DB"          "$(cat "$ws/postgres-language-server.jsonc")" '"connectionString": "postgres://u:p@h/d"'
 eq  "LSP config is private"       "$(ls -l "$ws/postgres-language-server.jsonc" | cut -c1-10)" "-rw-------"
@@ -186,7 +193,7 @@ eq  "legacy hand-appended block isn't duplicated" "$(grep -c '^\[keys.normal.spa
 has "…and the user's other keys survive"         "$(cat "$gen")" 'C-g = "x"'
 printf 'theme = "mine"\n' > "$tmp/hx/config.toml"
 eq  "user's own config is untouched"             "$(cat "$tmp/hx/config.toml")" 'theme = "mine"'
-has "workspace gets the language server entry"   "$(cat "$ws/.helix/languages.toml")" 'postgres-language-server'
+has "root gets the language server entry"        "$(cat "$ws/.helix/languages.toml")" 'postgres-language-server'
 
 # ------------------------------------------------------------------ success-scripts + CSV
 echo "success-scripts and CSV"

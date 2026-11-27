@@ -175,9 +175,16 @@ export_pg_env() {  # postgres://user:pass@host:port/db?k=v  ->  libpq PG* variab
 setup_workspace() {  # prints the workspace dir for connection $1
   local ws="$PGIDE_HOME/$1"
   mkdir -p "$ws" "$PGIDE_SNIPPETS" "$PGIDE_STATE/runs/$1" "$PGIDE_STATE/panes"
-  # every workspace sees the same bank as ./snippets (re-pointed on each open, so changing
-  # PGIDE_SNIPPETS takes effect straight away)
-  if [ ! -d "$ws/snippets" ] || [ -L "$ws/snippets" ]; then ln -sfn "$PGIDE_SNIPPETS" "$ws/snippets"; fi
+  # Helix runs from $PGIDE_HOME, so the default bank ($PGIDE_HOME/_snippets) is a real sibling
+  # of the workspaces (file browsers resolve symlinks, which makes "back" jump somewhere
+  # unexpected). A bank elsewhere is linked in as $PGIDE_HOME/snippets. Older versions put a
+  # snippets symlink in each workspace; drop it.
+  if [ -L "$ws/snippets" ]; then rm -f "$ws/snippets"; fi
+  if [ "$PGIDE_SNIPPETS" != "$PGIDE_HOME/_snippets" ]; then
+    if [ ! -d "$PGIDE_HOME/snippets" ] || [ -L "$PGIDE_HOME/snippets" ]; then
+      ln -sfn "$PGIDE_SNIPPETS" "$PGIDE_HOME/snippets"
+    fi
+  fi
   # with PGIDE_SCRIPTS set, ./outputs is this customer's results folder (customers/<name>)
   if [ -n "$PGIDE_SCRIPTS" ] && [ -d "$PGIDE_SCRIPTS" ]; then
     mkdir -p "$PGIDE_SCRIPTS/customers/${PGIDE_CUSTOMER:-$1}"
@@ -218,7 +225,7 @@ EOF
   chmod 600 "$f"
 }
 
-write_helix_config() {  # $1 = workspace. Prints the config file for `hx -c`.
+write_helix_config() {  # $1 = Helix's root directory ($PGIDE_HOME). Prints the config file for `hx -c`.
   # Helix has no include mechanism, so pgide's keys are merged with yours into a generated
   # file that only pgide-launched Helix instances use. Your own config is never touched.
   local out="$PGIDE_STATE/helix/config.toml" mine="$PGIDE_CONFIG/helix/config.toml"
@@ -234,7 +241,7 @@ write_helix_config() {  # $1 = workspace. Prints the config file for `hx -c`.
       skip && /^\[/ && $0 !~ /^\[keys\.(normal|select)\.space\.","\]/ { skip = 0 }
       !skip { print }' "$user"
     printf '\n'; cat "$mine"; } > "$out"
-  # the workspace-local languages.toml is layered over yours by Helix itself
+  # the root-local languages.toml is layered over yours by Helix itself
   cat "$lang" > "$1/.helix/languages.toml"
   printf '%s' "$out"
 }
@@ -272,8 +279,11 @@ cmd_open() {
   # credentials: the LSP gets its DB settings from the per-workspace config file only.
   local scrub=()
   for v in $PG_VARS; do scrub+=(-u "$v"); done
-  local hxcfg; hxcfg="$(write_helix_config "$ws")"
-  ( cd "$ws" && env "${scrub[@]}" PGIDE_CONN="$name" PGIDE_REPL_PANE="$repl" hx -c "$hxcfg" scratch.sql ) || true
+  # Helix runs from $PGIDE_HOME so the snippet bank and every workspace are siblings; the
+  # language server still finds the right per-connection settings via the file's own directory.
+  local hxcfg; hxcfg="$(write_helix_config "$PGIDE_HOME")"
+  rm -f "$ws/.helix/languages.toml"; rmdir "$ws/.helix" 2>/dev/null || true   # from older versions
+  ( cd "$PGIDE_HOME" && env "${scrub[@]}" PGIDE_CONN="$name" PGIDE_REPL_PANE="$repl" hx -c "$hxcfg" "$name/scratch.sql" ) || true
 
   _cleanup_open
   if ask "Close the psql pane for $name too?" y; then
@@ -647,10 +657,10 @@ cmd_keys() {  # writes the cheat sheet that `space , ?` opens; prints its path
   o   browse this customer's CSVs        i   inspect report + slow logs (CSV)
   s   30 days of slow logs               g   logs for one backend type
   m   REST path metrics                  A   analyze: runs queries/*.sql (asks first)
-  Results are in ./outputs (customers/<name> in success-scripts); open files with space f.
+  Results are in <name>/outputs (customers/<name> in success-scripts); open files with space f.
 
 A block is the run of non-blank lines around the cursor.
-Snippets: space f, then type snippets/
+Snippets: space e or space f, then _snippets/
 Close this buffer with :bc
 EOF
   printf '%s' "$f"

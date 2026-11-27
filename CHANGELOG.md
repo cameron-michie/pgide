@@ -17,6 +17,7 @@
 - `pgide csv FILE|DIR` views CSV files in pspg.
 - success-scripts integration (`PGIDE_SCRIPTS`): Helix keys `space , i/s/g/m/A/o` run its inspect, Logflare and analyze scripts for the session in a pane under psql, `space , v` and the CSV picker show CSVs in the existing results pane, and each workspace gets `./outputs`. `pgide csv DIR` now searches recursively, newest first, and reads TSV.
 - CSVs open with a column cursor and cells trimmed to `PGIDE_CSV_WIDTH` (default 60); `pgide csv --width N|--full`.
+- Helix now starts in `PGIDE_HOME` (not the workspace), so `_snippets/` and the workspaces are real siblings and file-browser navigation works; no more per-workspace `snippets` symlink (a custom `PGIDE_SNIPPETS` shows as `snippets/` at the root).
 - pspg now runs with `-s 0` (terminal background, no blue).
 - WezTerm key defaults to `CMD+SHIFT+p` when no leader is set; `option_as_alt` is now opt-in.
 - The installer downloads postgres-language-server's official release binary instead of

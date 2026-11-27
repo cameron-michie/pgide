@@ -192,18 +192,18 @@ name is the session name, or `PGIDE_CUSTOMER` in the connection file
 | `space , v` | Open the CSV in the current Helix buffer in pspg |
 
 When a job finishes it offers to open the customer's CSV picker in the results pane (`q` in pspg returns to the picker, Esc leaves it).
-Each workspace also gets `./outputs`, a link to `customers/<name>`, so `space f` then
-`outputs/` opens any result in Helix. Helix has no hook that fires when a file opens, so a CSV
+Each workspace also gets `outputs/`, a link to `customers/<name>`, so `space f` then
+`<name>/outputs/` opens any result in Helix. Helix has no hook that fires when a file opens, so a CSV
 opened there shows as text; press `space , v` to read it in pspg instead.
 
 ## Snippets
 
 Your bank of saved queries is one directory, `~/sql/_snippets` by default (`pgide snippets`
-prints it; set `PGIDE_SNIPPETS` in `~/.config/pgide/config` to use another, such as a git
-repo). Each workspace gets it as `./snippets`, so every connection shares the same bank. In
-Helix, open one with `space f` and type `snippets/`, or `:open snippets/<Tab>`. (`:open` on
-the bare directory errors, since Helix can't open a folder as a buffer.) To save a query, write
-it to a file in there with `:write snippets/name.sql`, or copy it from the scratch buffer.
+prints it). Helix starts in `~/sql`, so `_snippets/` and every connection's workspace are
+sibling folders: `space e` (file explorer) or `space f` (picker) reaches them, and going
+"back" from one lands next to the others. In Helix, save a query with
+`:write _snippets/name.sql`. To keep the bank somewhere else, set `PGIDE_SNIPPETS` in
+`~/.config/pgide/config` (a git repo, say); it appears as `snippets/` next to the workspaces.
 The installer seeds the bank with the examples in this repo's `snippets/` but never overwrites.
 
 [`snippets/rls-impersonate.sql`](snippets/rls-impersonate.sql) runs checks as an
