@@ -69,7 +69,26 @@ select auth.uid() -- trailing comment
 EOF
 eq "block around a line" "$( ( . "$PGIDE"; extract_block "$f" 4 ) )" \
    "select count(*)${nl}  from public.orders o${nl} where o.status = 'open'"
-if ( . "$PGIDE"; extract_block "$f" 6 ) >/dev/null; then bad "blank line → error" ""; else ok "blank line → error"; fi
+eq "blank line runs the block above it" "$( ( . "$PGIDE"; extract_block "$f" 6 ) )" \
+   "select count(*)${nl}  from public.orders o${nl} where o.status = 'open'"
+printf '\n\nselect 1;\n' > "$tmp/lead.sql"
+if ( . "$PGIDE"; extract_block "$tmp/lead.sql" 1 ) >/dev/null; then bad "blank with nothing above → error" ""; else ok "blank with nothing above → error"; fi
+cat > "$tmp/fn.sql" <<'EOF'
+select 1;
+
+create function f() returns int language plpgsql as $$
+begin
+
+  return 1;
+
+end
+$$;
+
+select 2;
+EOF
+eq "function body with blank lines is one block" "$( ( . "$PGIDE"; extract_block "$tmp/fn.sql" 6 ) | wc -l | tr -d ' ' )" "7"
+eq "cursor after the function runs the function" "$( ( . "$PGIDE"; extract_block "$tmp/fn.sql" 10 ) | head -n1 )" "create function f() returns int language plpgsql as \$\$"
+eq "statement after it is separate" "$( ( . "$PGIDE"; extract_block "$tmp/fn.sql" 11 ) )" "select 2;"
 if ( . "$PGIDE"; extract_block "$f" 99 ) >/dev/null; then bad "past EOF → error" ""; else ok "past EOF → error"; fi
 eq "identifier mid-word"         "$( ( . "$PGIDE"; ident_at "$f" 4 13 ) )" "public.orders"
 eq "identifier before ()"        "$( ( . "$PGIDE"; ident_at "$f" 12 10 ) )" "auth.uid"
@@ -168,6 +187,22 @@ has "…and the user's other keys survive"         "$(cat "$gen")" 'C-g = "x"'
 printf 'theme = "mine"\n' > "$tmp/hx/config.toml"
 eq  "user's own config is untouched"             "$(cat "$tmp/hx/config.toml")" 'theme = "mine"'
 has "workspace gets the language server entry"   "$(cat "$ws/.helix/languages.toml")" 'postgres-language-server'
+
+# ------------------------------------------------------------------ success-scripts + CSV
+echo "success-scripts and CSV"
+pref() { ( . "$PGIDE"; export_pg_env "$1" >/dev/null 2>&1; project_ref ); }
+eq "ref from a pooler user"    "$(pref 'postgresql://postgres.abcdefgh:pw@aws-0-eu-west-2.pooler.supabase.com:5432/postgres')" "abcdefgh"
+eq "ref from a direct host"    "$(pref 'postgresql://postgres:pw@db.zzzyyyxxx.supabase.co:5432/postgres')" "zzzyyyxxx"
+if pref 'postgres://u@localhost/d' >/dev/null; then bad "no ref for localhost" ""; else ok "no ref for localhost"; fi
+out="$(pg task inspect 2>&1)"; has "task needs PGIDE_SCRIPTS" "$out" "set PGIDE_SCRIPTS"
+printf 'a,b\n1,2\n' > "$tmp/x.csv"; printf 'x\n' > "$tmp/x.txt"
+out="$(pg view "$tmp/x.txt" 2>&1)"; has "view refuses non-CSV" "$out" "not a CSV/TSV"
+out="$(pg view "$tmp/nope.csv" 2>&1)"; has "view refuses a missing file" "$out" "can't read"
+mkdir -p "$tmp/scripts/customers/acme"
+ws="$( ( export PGIDE_SCRIPTS="$tmp/scripts"; . "$PGIDE"; setup_workspace acme ) )"
+eq "workspace links ./outputs to the customer dir" "$(readlink "$ws/outputs")" "$tmp/scripts/customers/acme"
+ws="$( ( export PGIDE_SCRIPTS="$tmp/scripts"; PGIDE_CUSTOMER=other; . "$PGIDE"; setup_workspace acme2 ) )"
+eq "…or to PGIDE_CUSTOMER when set"                "$(readlink "$ws/outputs")" "$tmp/scripts/customers/other"
 
 echo
 echo "$pass passed, $fail failed"

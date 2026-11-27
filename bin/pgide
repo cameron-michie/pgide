@@ -11,7 +11,7 @@
 #   pgide                      pick a saved connection, or paste a URL (fzf)
 #   pgide URL | connect [URL]  open a workbench for a URL. Ephemeral: nothing is saved, and the
 #                              URL is dropped from disk when the editor closes
-#                              [--name N] [--prod] [--readonly] [--lsp]
+#                              [--name N] [--customer C] [--prod] [--readonly] [--lsp]
 #   pgide NAME | open NAME     open a workbench for a saved connection
 #   pgide add NAME [--keychain]  save a connection (URL goes in a 0600 file; --keychain = macOS Keychain)
 #   pgide ls | rm NAME | edit NAME | test NAME | doctor | version
@@ -20,9 +20,14 @@
 #   pgide run      [--mode auto|selection|block|file|clipboard] [--file F] [--line N] [--lang L]
 #   pgide explain  [--analyze] [same options as run]
 #   pgide describe [--file F --line N --col C]      (\d+ for relations, \sf+/\df+ for functions)
+#   pgide snippets            print the snippets directory (PGIDE_SNIPPETS)
 #   pgide cancel | toggle-x | focus | browse-tab | last-run
 #
 # psql-facing
+#   pgide view FILE            (editor) open the CSV buffer in pspg, in the session's results pane
+#   pgide task KIND            (editor) success-scripts job for this session, in a pane below psql:
+#                              inspect | analyze | slowlogs | backend-logs | metrics | outputs
+#   pgide csv [--width N|--full] FILE|DIR         view CSV files in pspg (DIR: pick from its *.csv; or pipe CSV on stdin)
 #   SELECT ... \g (format=csv) |pgide vd           open a result in VisiData (the psqlrc :vd macro)
 #
 # Debugging: PGIDE_DRYRUN=1 prints what would be sent to the psql pane instead of sending it.
@@ -37,13 +42,16 @@ PGIDE_VERSION="0.1.0"
 # which do NOT inherit your shell's environment). Put overrides of the defaults below in it.
 if [ -f "$PGIDE_CONFIG/config" ]; then . "$PGIDE_CONFIG/config"; fi
 
-: "${PGIDE_HOME:=$HOME/sql}"                                    # workspaces + _snippets
+: "${PGIDE_HOME:=$HOME/sql}"                                    # per-connection workspaces
+: "${PGIDE_SCRIPTS:=}"                                            # a success-scripts checkout (inspect.sh, analyze.sh, Logflare scripts)
+: "${PGIDE_SNIPPETS:=$PGIDE_HOME/_snippets}"                    # your bank of saved queries (any dir, e.g. a git repo)
 : "${PGIDE_STATE:=${XDG_STATE_HOME:-$HOME/.local/state}/pgide}" # run history, pane ids
 : "${PGIDE_KEYCHAIN_SERVICE:=pgide}"
 : "${PGIDE_LAYOUT:=bottom}"               # bottom | right   (where the psql/results pane goes)
 : "${PGIDE_SPLIT_PERCENT:=55}"            # size of the psql/results pane
 : "${PGIDE_BROWSER:=rainfrog}"            # rainfrog | harlequin   (for `space , b`)
 : "${PGIDE_PAGER:=pspg -X -F --ignore-case --bold-labels --no-commandbar -s 0}"  # -s 0 = terminal colours, see-through; try -s N for other themes
+: "${PGIDE_CSV_WIDTH:=60}"                 # trim CSV cells to this many chars in the pager (0 = show everything)
 : "${PGIDE_ECHO:=1}"                      # echo each statement above its results
 : "${PGIDE_FOCUS_RESULTS:=0}"             # move focus to the results pane after each run
 : "${PGIDE_DRYRUN:=0}"
@@ -101,7 +109,7 @@ valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
 load_flags() {  # sources the connection's (non-secret) flags
   local f; f="$(conn_file "$1")"
   [ -f "$f" ] || die "unknown connection '$1' (see: pgide ls)"
-  PGIDE_READONLY=0; PGIDE_DANGER=0; PGIDE_LSP_DB=0; PGIDE_URL=""
+  PGIDE_READONLY=0; PGIDE_DANGER=0; PGIDE_LSP_DB=0; PGIDE_URL=""; PGIDE_CUSTOMER=""
   # shellcheck source=/dev/null
   . "$f"
 }
@@ -166,8 +174,17 @@ export_pg_env() {  # postgres://user:pass@host:port/db?k=v  ->  libpq PG* variab
 # ---------------------------------------------------------------- workspace
 setup_workspace() {  # prints the workspace dir for connection $1
   local ws="$PGIDE_HOME/$1"
-  mkdir -p "$ws" "$PGIDE_HOME/_snippets" "$PGIDE_STATE/runs/$1" "$PGIDE_STATE/panes"
-  if [ ! -e "$ws/snippets" ]; then ln -s ../_snippets "$ws/snippets"; fi
+  mkdir -p "$ws" "$PGIDE_SNIPPETS" "$PGIDE_STATE/runs/$1" "$PGIDE_STATE/panes"
+  # every workspace sees the same bank as ./snippets (re-pointed on each open, so changing
+  # PGIDE_SNIPPETS takes effect straight away)
+  if [ ! -d "$ws/snippets" ] || [ -L "$ws/snippets" ]; then ln -sfn "$PGIDE_SNIPPETS" "$ws/snippets"; fi
+  # with PGIDE_SCRIPTS set, ./outputs is this customer's results folder (customers/<name>)
+  if [ -n "$PGIDE_SCRIPTS" ] && [ -d "$PGIDE_SCRIPTS" ]; then
+    mkdir -p "$PGIDE_SCRIPTS/customers/${PGIDE_CUSTOMER:-$1}"
+    if [ ! -d "$ws/outputs" ] || [ -L "$ws/outputs" ]; then
+      ln -sfn "$PGIDE_SCRIPTS/customers/${PGIDE_CUSTOMER:-$1}" "$ws/outputs"
+    fi
+  fi
   if [ ! -f "$ws/scratch.sql" ]; then
     cat > "$ws/scratch.sql" <<EOF
 -- $1 · scratch                         (blank lines separate runnable blocks)
@@ -280,10 +297,11 @@ ephemeral_name() {  # a short session name from a URL: <supabase ref | host>-<db
 }
 
 cmd_connect() {  # open a workbench for a URL without saving it anywhere
-  local url="" name="" danger=0 readonly=0 lsp=0 f
+  local url="" name="" customer="" danger=0 readonly=0 lsp=0 f
   while [ $# -gt 0 ]; do
     case "$1" in
       --name)     name="${2:-}"; shift 2 ;;
+      --customer) customer="${2:-}"; shift 2 ;;
       --prod)     danger=1; readonly=1; shift ;;
       --readonly) readonly=1; shift ;;
       --lsp)      lsp=1; shift ;;
@@ -309,6 +327,7 @@ PGIDE_DANGER=$danger
 PGIDE_READONLY=$readonly
 PGIDE_LSP_DB=$lsp
 PGIDE_URL=$(shell_quote "$url")
+PGIDE_CUSTOMER=$(shell_quote "$customer")
 EOF
   )
   ( cmd_open "$name" )
@@ -346,7 +365,9 @@ cmd_repl() {
   printf 'pgide: %s → %s\n' "$name" "$url"
   PSQLRC="$(psqlrc_wrapper)"; export PSQLRC
   if have pspg; then
-    PSQL_PAGER="$PGIDE_PAGER"; PSQL_WATCH_PAGER="pspg --stream"; export PSQL_PAGER PSQL_WATCH_PAGER
+    # env -u: the same stale LINES/COLUMNS problem applies to psql's own pager child
+    PSQL_PAGER="env -u LINES -u COLUMNS $PGIDE_PAGER"; PSQL_WATCH_PAGER="env -u LINES -u COLUMNS pspg --stream"
+    export PSQL_PAGER PSQL_WATCH_PAGER
   fi
   PGIDE_CONN="$name"; export PGIDE_CONN
 
@@ -462,13 +483,24 @@ parse_opts() {
   if [ ! -t 0 ]; then SEL="$(cat)"; fi
 }
 
-extract_block() {  # $1 = file, $2 = line → the run of non-blank lines around that line
+extract_block() {  # $1 = file, $2 = line → the statement block around that line
+  # A block is a run of non-blank lines. Blank lines inside a $$ … $$ (or $tag$ … $tag$) body
+  # don't end it, so a function with blank lines is one block. On a blank line the nearest
+  # block above is used, so the key still runs "the thing just behind the cursor".
   awk -v n="$2" '
-    { line[NR] = $0 }
+    { line[NR] = $0
+      sep[NR] = ($0 ~ /^[[:space:]]*$/ && open == "") ? 1 : 0
+      t = $0
+      while (match(t, /\$([A-Za-z_][A-Za-z_0-9]*)?\$/)) {
+        tag = substr(t, RSTART, RLENGTH); t = substr(t, RSTART + RLENGTH)
+        if (open == "") open = tag; else if (tag == open) open = ""
+      } }
     END {
-      if (n < 1 || n > NR || line[n] ~ /^[[:space:]]*$/) exit 2
-      s = n; while (s > 1  && line[s - 1] !~ /^[[:space:]]*$/) s--
-      e = n; while (e < NR && line[e + 1] !~ /^[[:space:]]*$/) e++
+      if (n < 1 || n > NR) exit 2
+      while (n > 1 && sep[n]) n--
+      if (sep[n]) exit 2
+      s = n; while (s > 1  && !sep[s - 1]) s--
+      e = n; while (e < NR && !sep[e + 1]) e++
       for (i = s; i <= e; i++) print line[i]
     }' "$1"
 }
@@ -589,6 +621,41 @@ EOF
 cmd_cancel()   { resolve_session; send_raw $'\003'; }
 cmd_toggle_x() { resolve_session; psql_command '\x'; }
 cmd_focus()    { resolve_session; focus_results; }
+cmd_keys() {  # writes the cheat sheet that `space , ?` opens; prints its path
+  local f="$PGIDE_STATE/keys.md"
+  mkdir -p "$PGIDE_STATE"
+  cat > "$f" <<'EOF'
+# pgide keys        (press Space, then comma, then the key; this buffer is regenerated each time)
+
+  r   run the selection, or the block under the cursor
+  a   run the whole file
+  p   run whatever is on the clipboard
+
+  e   EXPLAIN
+  E   EXPLAIN (ANALYZE, BUFFERS, ...), always rolled back
+  d   describe the name under the cursor (\d+ / \sf+ / \df+)
+
+  x   toggle expanded output (\x)
+  c   cancel the running query
+  f   focus the results pane
+  b   open rainfrog / harlequin on this connection in a new tab
+  l   open the SQL file of the last run
+
+  v   view the current CSV/TSV buffer in pspg, in the results pane
+
+  success-scripts (PGIDE_SCRIPTS), run for this session's database in a pane under psql:
+  o   browse this customer's CSVs        i   inspect report + slow logs (CSV)
+  s   30 days of slow logs               g   logs for one backend type
+  m   REST path metrics                  A   analyze: runs queries/*.sql (asks first)
+  Results are in ./outputs (customers/<name> in success-scripts); open files with space f.
+
+A block is the run of non-blank lines around the cursor.
+Snippets: space f, then type snippets/
+Close this buffer with :bc
+EOF
+  printf '%s' "$f"
+}
+
 cmd_last_run() {
   local l="$PGIDE_STATE/runs/last.sql"
   [ -e "$l" ] || die "nothing has been run yet"
@@ -618,6 +685,46 @@ cmd_browse_tab() {
   wez cli set-tab-title --pane-id "$p" "pg:$SESSION_CONN · browse" >/dev/null 2>&1 || true
 }
 
+cmd_csv() {  # view CSV/TSV in pspg: a file, a directory of them (pick with fzf), or stdin
+  need pspg "brew install pspg"
+  # Started from psql's \!, we inherit the LINES/COLUMNS that psql's readline exported at
+  # startup. ncurses trusts them over the real terminal size, so pspg would draw into a stale
+  # area and ignore resizes.
+  unset LINES COLUMNS
+  while :; do
+    case "${1:-}" in
+      --width) PGIDE_CSV_WIDTH="${2:-}"; shift 2 ;;
+      --full)  PGIDE_CSV_WIDTH=0; shift ;;
+      *) break ;;
+    esac
+  done
+  case "$PGIDE_CSV_WIDTH" in ''|*[!0-9]*) die "--width needs a number" ;; esac
+  local target="${1:-}" f fmt=--csv
+  # --vertical-cursor: a column cursor (Left/Right move between columns; Alt+v toggles it)
+  local opts="--vertical-cursor"
+  if [ -z "$target" ]; then
+    [ ! -t 0 ] || die "usage: pgide csv [--width N|--full] FILE|DIR   (or pipe CSV in)"
+    if [ "$PGIDE_CSV_WIDTH" -gt 0 ]; then opts="$opts --csv-trim-width=$PGIDE_CSV_WIDTH"; fi
+    $PGIDE_PAGER --csv --csv-header on $opts; return
+  fi
+  if [ -d "$target" ]; then
+    need fzf
+    local files
+    while :; do  # newest first; q in pspg returns to the picker, Esc leaves it
+      files="$(cd "$target" && find . \( -name '*.csv' -o -name '*.tsv' \) -type f -print0 \
+                 | xargs -0 ls -t 2>/dev/null | sed 's|^\./||')"
+      if [ -z "$files" ]; then printf 'no CSV files in %s\n[enter] to close ' "$target"; read -r _ || true; return; fi
+      f="$(printf '%s\n' "$files" | fzf --prompt='csv › ' --height=60% --reverse \
+             --preview "head -n 20 \"$target/\"{}")" || return 0
+      [ -n "$f" ] || return 0
+      cmd_csv "$target/$f" || true
+    done
+  fi
+  [ -f "$target" ] || die "no such file: $target"
+  case "$target" in *.tsv) fmt=--tsv ;; *) if [ "$PGIDE_CSV_WIDTH" -gt 0 ]; then opts="$opts --csv-trim-width=$PGIDE_CSV_WIDTH"; fi ;; esac
+  $PGIDE_PAGER $fmt --csv-header on $opts -f "$target"
+}
+
 cmd_vd() {  # stdin = CSV (from psql: \g (format=csv) |pgide vd)
   need vd "brew install visidata"
   local dir="$PGIDE_STATE/results" f
@@ -626,6 +733,101 @@ cmd_vd() {  # stdin = CSV (from psql: \g (format=csv) |pgide vd)
   [ -s "$f" ] || die "no rows to show"
   wez cli split-pane --pane-id "${WEZTERM_PANE:?not inside WezTerm}" --right --percent 60 \
       -- "$SELF" _vd "$f" >/dev/null
+}
+
+# ---------------------------------------------------------------- success-scripts + CSV viewing
+need_scripts() {
+  [ -n "$PGIDE_SCRIPTS" ] && [ -d "$PGIDE_SCRIPTS" ] \
+    || die "set PGIDE_SCRIPTS=/path/to/success-scripts in $PGIDE_CONFIG/config"
+}
+
+show_csv() {  # show CSV file/dir in the session's psql pane, where pspg lives (needs resolve_session)
+  psql_command "\\! $(shell_quote "$SELF") csv $(shell_quote "$1")"
+  focus_results
+}
+
+cmd_view() {  # open a CSV/TSV buffer from the editor in the pager (Helix can't show them)
+  local f="${1:-}"
+  [ -n "$f" ] || die "usage: pgide view FILE"
+  case "$f" in /*) ;; *) f="$PWD/$f" ;; esac
+  [ -f "$f" ] || die "can't read '$f' — save the buffer first"
+  case "$f" in *.csv|*.tsv) ;; *) die "not a CSV/TSV file: $f" ;; esac
+  resolve_session
+  show_csv "$f"
+}
+
+project_ref() {  # the Supabase project ref, from the exported PG* variables
+  local h
+  case "${PGUSER:-}" in *.*) printf '%s' "${PGUSER#*.}"; return ;; esac
+  case "${PGHOST:-}" in db.*.supabase.co) h="${PGHOST#db.}"; printf '%s' "${h%%.*}"; return ;; esac
+  return 1
+}
+
+cmd_task() {  # editor-facing: run a success-scripts job for this session in a pane under the psql pane
+  local kind="${1:-}"
+  [ -n "$kind" ] || die "usage: pgide task inspect|analyze|slowlogs|backend-logs|metrics|outputs"
+  shift
+  need_scripts
+  resolve_session
+  if [ "$kind" = outputs ]; then  # no job: just browse the customer's CSVs in the results pane
+    load_flags "$SESSION_CONN"
+    mkdir -p "$PGIDE_SCRIPTS/customers/${PGIDE_CUSTOMER:-$SESSION_CONN}"
+    show_csv "$PGIDE_SCRIPTS/customers/${PGIDE_CUSTOMER:-$SESSION_CONN}"
+    return
+  fi
+  wez cli split-pane --pane-id "$SESSION_PANE" --bottom --percent 35 --cwd "$PGIDE_SCRIPTS" \
+      -- "$SELF" _task "$SESSION_CONN" "$SESSION_PANE" "$kind" "$@" >/dev/null || die "couldn't split the pane"
+}
+
+cmd__task() {  # runs inside the new pane
+  local conn="$1" pane="$2" kind="$3" url cust ref="" ans day from until btype out
+  shift 3
+  valid_name "$conn" || die "bad session name"
+  load_flags "$conn"; need_scripts
+  url="$(resolve_url "$conn")"
+  export_pg_env "$url"
+  cust="${PGIDE_CUSTOMER:-$conn}"
+  ref="$(project_ref)" || ref=""
+  # LOGFLARE_KEY etc. Sourced after export_pg_env, which clears PGOPTIONS.
+  if [ -f "$PGIDE_SCRIPTS/.env" ]; then set -a; . "$PGIDE_SCRIPTS/.env"; set +a; fi
+  cd "$PGIDE_SCRIPTS"
+  mkdir -p "customers/$cust"
+  day="$(date +%F)"
+  case "$kind" in
+    inspect)  # supabase inspect report + Logflare slow logs → CSV   (optional arg: days)
+      ./inspect.sh "$url" "$cust" "$@" --csv ;;
+    analyze)
+      printf 'analyze.sh runs every queries/*.sql against %s UNCHECKED. They can be destructive and\n' "$conn"
+      printf 'put load on the database; make sure you have approval.\n'
+      if [ "$PGIDE_DANGER" = 1 ]; then printf '⚠  %s is flagged production.\n' "$conn"; fi
+      ask "Run them?" n || return 0
+      ./analyze.sh "$url" "$cust" ;;
+    slowlogs)  # 30 days of slow query logs from Logflare, converted to CSV
+      [ -n "$ref" ] || die "can't tell the project ref from this URL"
+      ./scripts/slow_logs.sh "$ref" "$cust"
+      out="customers/$cust/$ref/$day/30d_slow_logs.json"
+      [ -s "$out" ] && python3 ./scripts/slow-queries-to-csv.py "$out" ;;
+    backend-logs)  # Postgres logs for one backend type, paged from Logflare
+      [ -n "$ref" ] || die "can't tell the project ref from this URL"
+      printf 'backend type [client backend]: '; read -r btype || btype=""; btype="${btype:-client backend}"
+      from="$(date -u -v-1d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)"
+      until="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf 'from [%s]: ' "$from"; read -r ans || ans=""; from="${ans:-$from}"
+      printf 'until [%s]: ' "$until"; read -r ans || ans=""; until="${ans:-$until}"
+      out="customers/$cust/$ref/logs-$(printf '%s' "$btype" | tr ' ' '-')-$day.txt"
+      mkdir -p "customers/$cust/$ref"
+      ./scripts/logflare_query_backed_type.sh "$ref" "$btype" "$from" "$until" "$out" ;;
+    metrics)  # REST paths via the Logflare endpoints
+      [ -n "$ref" ] || die "can't tell the project ref from this URL"
+      python3 ./scripts/lf_endpoints.py --project "$ref" --customer "$cust" ;;
+    outputs) ;;
+    *) die "unknown task '$kind'" ;;
+  esac
+  printf '\nresults: %s/customers/%s\n[enter] view the CSVs in the results pane · [q] close: ' "$PGIDE_SCRIPTS" "$cust"
+  ans=""; read -r ans || return 0
+  case "$ans" in q|Q) return 0 ;; esac
+  PGIDE_CONN="$conn" PGIDE_REPL_PANE="$pane"; resolve_session
+  show_csv "$PGIDE_SCRIPTS/customers/$cust"
 }
 
 # ---------------------------------------------------------------- connection management
@@ -754,9 +956,15 @@ main() {
     toggle-x)      cmd_toggle_x ;;
     focus)         cmd_focus ;;
     last-run)      cmd_last_run ;;
+    keys)          cmd_keys ;;
+    snippets)      printf '%s\n' "$PGIDE_SNIPPETS" ;;
     browse)        cmd_browse "$@" ;;
     browse-tab)    cmd_browse_tab ;;
     vd)            cmd_vd ;;
+    csv)           cmd_csv "$@" ;;
+    view)          cmd_view "$@" ;;
+    task)          cmd_task "$@" ;;
+    _task)         cmd__task "$@" ;;
     _vd)           exec vd "$1" ;;
     -h|--help|help) usage ;;
     -V|--version|version) printf 'pgide %s\n' "$PGIDE_VERSION" ;;

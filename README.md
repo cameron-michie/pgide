@@ -113,15 +113,16 @@ In Helix, press Space, then `,`, then the key (one after another, not held):
 | `f` | Focus the results pane |
 | `b` | Open rainfrog / Harlequin on the same connection in a new tab |
 | `l` | Open the exact SQL file of the last run |
-| `?` | Show a legend |
+| `?` | Open a cheat sheet |
 
 A **block** is the run of non-blank lines around the cursor and may hold several
 statements. Keep a unit of work (`begin; set local role …; select …; rollback;`) together
-with no blank lines inside it. For function bodies containing blank lines, select them or
-use `space , a`.
+with no blank lines inside it. Blank lines inside a `$$ … $$` function body don't end the
+block. On a blank line, `r` runs the nearest block above it, so you can press it just after
+a statement or function.
 
 Helix can't put descriptions on custom keys, so the `space ,` popup shows the multi-step
-bindings as "[Multiple commands]". The `?` entry puts a legend in the popup instead.
+bindings as "[Multiple commands]". Press `?` there to open a cheat sheet in a buffer.
 
 Every run is saved under `~/.local/state/pgide/runs/<connection>/` before it executes, so
 there's a timestamped record of exactly what ran against which database. Scripts stop at
@@ -134,6 +135,22 @@ Use `hjkl` or the arrow keys to move, `/` to search, `0`–`9` to freeze that ma
 columns or a block and copy them, `F9` for the menu, and `q` to go back to psql. Results
 that fit on screen print inline without opening the pager. `\watch 2` in the psql pane
 streams into pspg.
+
+To read CSV files in the same pager (sort, search, freeze columns), use `pgide csv`:
+
+```sh
+supabase inspect report --output-dir ~/inspect    # one CSV per inspect command
+pgide csv ~/inspect                               # pick one with fzf; q returns to the picker
+pgide csv bloat.csv                               # a single file
+some-command-that-prints-csv | pgide csv          # or stdin
+```
+
+Moving across columns: `Shift`+`←`/`→` scroll one column at a time, `c` searches for a column by
+name, `Alt`+`v` toggles a column cursor (on by default for CSVs, so `←`/`→` move between
+columns), and `0`–`9` freeze that many columns. pspg can't wrap text. For wide columns, CSV
+cells are trimmed to 60 characters (`PGIDE_CSV_WIDTH=N` in `~/.config/pgide/config`, `0` for no
+trimming). One-off: `pgide csv --width 30 FILE` or `pgide csv --full FILE`. Trimming only
+affects the display, so `--full` shows long SQL in a cell when you need to read it.
 
 pgide runs pspg with `-s 0`, which uses your terminal's own background and colours (pspg's
 own default is a solid blue). For another theme try `20` (Tao Light), `21` (FlatWhite) or `23`
@@ -154,6 +171,41 @@ authenticated EXECUTE) `:settings` `:uptime`
 End a query with `:csv` (copy as CSV) or `:vd` (open in VisiData in a split) instead of
 `;`.
 
+## success-scripts
+
+With `PGIDE_SCRIPTS=~/supabase-projects/success-scripts` in `~/.config/pgide/config`, the
+session's own connection drives that repo's scripts, so you never paste the URL again. Each
+key runs in a pane stacked under the psql pane (the repo's `.env` supplies `LOGFLARE_KEY`), and
+the pane closes when the job ends. CSVs open in the existing psql/pspg pane: pgide sends it
+`\! pgide csv …`, so pspg takes over that pane and `q` returns you to the psql prompt. The customer
+name is the session name, or `PGIDE_CUSTOMER` in the connection file
+(`pgide connect URL --name x --customer acme`).
+
+| Key | Runs |
+|---|---|
+| `space , i` | `inspect.sh <url> <customer> --csv`: `supabase inspect report` plus Logflare slow logs as CSV |
+| `space , s` | 30 days of slow logs from Logflare, converted to CSV |
+| `space , g` | Postgres logs for one backend type, paged out of Logflare (it asks for type and times) |
+| `space , m` | REST path metrics from the Logflare endpoints |
+| `space , A` | `analyze.sh`, the unchecked `queries/*.sql`. It asks first, and warns on production |
+| `space , o` | Browse this customer's CSVs, newest first |
+| `space , v` | Open the CSV in the current Helix buffer in pspg |
+
+When a job finishes it offers to open the customer's CSV picker in the results pane (`q` in pspg returns to the picker, Esc leaves it).
+Each workspace also gets `./outputs`, a link to `customers/<name>`, so `space f` then
+`outputs/` opens any result in Helix. Helix has no hook that fires when a file opens, so a CSV
+opened there shows as text; press `space , v` to read it in pspg instead.
+
+## Snippets
+
+Your bank of saved queries is one directory, `~/sql/_snippets` by default (`pgide snippets`
+prints it; set `PGIDE_SNIPPETS` in `~/.config/pgide/config` to use another, such as a git
+repo). Each workspace gets it as `./snippets`, so every connection shares the same bank. In
+Helix, open one with `space f` and type `snippets/`, or `:open snippets/<Tab>`. (`:open` on
+the bare directory errors, since Helix can't open a folder as a buffer.) To save a query, write
+it to a file in there with `:write snippets/name.sql`, or copy it from the scratch buffer.
+The installer seeds the bank with the examples in this repo's `snippets/` but never overwrites.
+
 [`snippets/rls-impersonate.sql`](snippets/rls-impersonate.sql) runs checks as an
 authenticated user or as anon, the way PostgREST does, inside a rolled-back transaction.
 
@@ -168,8 +220,11 @@ PGIDE_SPLIT_PERCENT=50       # size of the psql pane (default 55)
 PGIDE_BROWSER=harlequin      # default: rainfrog
 PGIDE_FOCUS_RESULTS=1        # jump to the results after every run
 PGIDE_ECHO=0                 # don't echo statements above their results
+PGIDE_CSV_WIDTH=60           # trim CSV cells in the pager (0 = off)
 PGIDE_PAGER='pspg -X -F --ignore-case --bold-labels --no-commandbar -s 20'  # default is -s 0
 PGIDE_HOME=~/work/sql        # per-connection workspaces (default ~/sql)
+PGIDE_SNIPPETS=~/work/queries  # your snippet bank (default ~/sql/_snippets)
+PGIDE_SCRIPTS=~/supabase-projects/success-scripts   # enables the space , i/s/g/m/A/o keys
 ```
 
 ## How it works

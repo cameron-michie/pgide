@@ -9,26 +9,37 @@
 # (e.g. begin … rollback) together with no blank lines inside it.
 
 [keys.normal.space.","]
-# Helix can't label custom keys, and shows every multi-step binding as "[Multiple commands]".
-# This entry puts a legend in the popup itself (pressing ? also echoes it to the status line).
-"?" = ':echo r run · a file · p clipboard · e explain · E analyze · d describe · x expanded · c cancel · f focus · b browse · l last-run'
+# Helix can't label custom keys: a key bound to a command sequence (anything that saves the
+# file first) always shows as "[Multiple commands]" in the popup, while a single `:sh`
+# command shows its own text, so those carry a trailing "# description" (the shell ignores it).
+# ? opens a cheat sheet in a buffer.
+"?" = ":open %sh{pgide keys}"
 # run: the selection if you've made one, otherwise the block under the cursor
 r = [":update", ':pipe-to pgide run --file "%{buffer_name}" --line %{cursor_line} --lang %{language}']
 # run the whole file
 a = [":update", ':sh pgide run --mode file --file "%{buffer_name}" --lang %{language}']
 # run whatever is on the clipboard (pasted scripts, without touching the buffer)
-p = ":sh pgide run --mode clipboard"
+p = ":sh pgide run --mode clipboard  # run the clipboard"
 # EXPLAIN / EXPLAIN (ANALYZE, BUFFERS, …) — analyze runs inside a transaction that is rolled back
 e = [":update", ':pipe-to pgide explain --file "%{buffer_name}" --line %{cursor_line} --lang %{language}']
 E = [":update", ':pipe-to pgide explain --analyze --file "%{buffer_name}" --line %{cursor_line} --lang %{language}']
 # describe the table / view / function under the cursor (\d+, \sf+ or \df+)
 d = [":update", ':pipe-to pgide describe --file "%{buffer_name}" --line %{cursor_line} --col %{cursor_column}']
 # psql pane helpers
-x = ":sh pgide toggle-x"     # toggle expanded output (\x)
-c = ":sh pgide cancel"       # cancel the running query (Ctrl-C in the psql pane)
-f = ":sh pgide focus"        # jump to the results pane (WezTerm pane focus)
-b = ":sh pgide browse-tab"   # open rainfrog/harlequin on the same connection in a new tab
+x = ":sh pgide toggle-x  # toggle expanded output"
+c = ":sh pgide cancel  # cancel the running query"
+f = ":sh pgide focus  # focus the results pane"
+b = ":sh pgide browse-tab  # open rainfrog/harlequin in a new tab"
 l = ":open %sh{pgide last-run}"   # open the exact SQL file of the last run
+# CSVs: Helix can't show them, so open the current CSV buffer in pspg in the results pane
+v = ':sh pgide view "%{buffer_name}"  # view this CSV in the results pane'
+# success-scripts (needs PGIDE_SCRIPTS): each runs for this session's database in a pane under the psql pane
+o = ":sh pgide task outputs  # browse this customer's CSVs"
+i = ":sh pgide task inspect  # inspect report + Logflare slow logs"
+s = ":sh pgide task slowlogs  # 30 days of Logflare slow logs"
+g = ":sh pgide task backend-logs  # Logflare logs for one backend type"
+m = ":sh pgide task metrics  # Logflare REST path metrics"
+A = ":sh pgide task analyze  # run queries/*.sql (asks first)"
 
 [keys.select.space.","]
 r = ':pipe-to pgide run --mode selection --lang %{language}'
